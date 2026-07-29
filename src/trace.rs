@@ -39,10 +39,6 @@ pub const HEADER_SIZE: usize = 16;
 /// Total size of trace footer in bytes.
 pub const FOOTER_SIZE: usize = 16;
 
-/// Known Linux x86-64 terminating syscall numbers.
-pub const SYS_EXIT_X86_64: u64 = 60;
-pub const SYS_EXIT_GROUP_X86_64: u64 = 231;
-
 /// In-memory representation of a parsed trace event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceEvent {
@@ -72,6 +68,13 @@ impl TraceEvent {
         match self {
             TraceEvent::SyscallEnter { tid, .. } => *tid,
             TraceEvent::SyscallExit { tid, .. } => *tid,
+        }
+    }
+
+    pub fn syscall_number(&self) -> u64 {
+        match self {
+            TraceEvent::SyscallEnter { number, .. } => *number,
+            TraceEvent::SyscallExit { number, .. } => *number,
         }
     }
 }
@@ -443,8 +446,8 @@ fn validate_syscall_pairing(events: &[TraceEvent]) -> Result<(), String> {
     Ok(())
 }
 
-/// Parses a trace file from disk and prints its human-readable dump to stdout.
-pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
+/// Reads a trace file from disk and parses its binary format into validated `TraceEvent` objects.
+pub fn read_trace_file<P: AsRef<Path>>(path: P) -> Result<Vec<TraceEvent>, String> {
     let path_ref = path.as_ref();
     let mut file = File::open(path_ref)
         .map_err(|e| format!("cannot open trace '{}': {}", path_ref.display(), e))?;
@@ -453,7 +456,12 @@ pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
     file.read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read trace '{}': {}", path_ref.display(), e))?;
 
-    let events = parse_trace_bytes(&bytes)?;
+    parse_trace_bytes(&bytes)
+}
+
+/// Parses a trace file from disk and prints its human-readable dump to stdout.
+pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
+    let events = read_trace_file(path)?;
 
     for event in events {
         match event {

@@ -1,3 +1,4 @@
+pub mod replay;
 pub mod trace;
 pub mod tracer;
 
@@ -8,6 +9,7 @@ use std::process;
 fn print_usage() {
     eprintln!("Usage: causal record [-o <trace>] <program> [args...]");
     eprintln!("       causal dump <trace>");
+    eprintln!("       causal replay <trace> <program> [args...]");
 }
 
 fn main() {
@@ -66,6 +68,28 @@ fn main() {
                 process::exit(1);
             }
             process::exit(0);
+        }
+        "replay" => {
+            if args.len() < 4 {
+                print_usage();
+                process::exit(2);
+            }
+            let trace_file = Path::new(&args[2]);
+            let target = &args[3];
+            let target_args = &args[4..];
+
+            match replay::run_replay(trace_file, target, target_args) {
+                Ok(tracer::TraceeTermination::Exited(code)) => {
+                    process::exit(code);
+                }
+                Ok(tracer::TraceeTermination::Signaled(sig)) => {
+                    process::exit(128 + sig);
+                }
+                Err(err) => {
+                    eprintln!("causal: {}", err);
+                    process::exit(1);
+                }
+            }
         }
         _ => {
             print_usage();

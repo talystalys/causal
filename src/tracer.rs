@@ -47,63 +47,92 @@ const STAGE_STARTUP_STOP: u32 = 2;
 const STAGE_EXEC: u32 = 3;
 
 /// Formats an OS errno into a readable message.
-fn format_errno(errno: i32) -> String {
+pub fn format_errno(errno: i32) -> String {
     format!("{}", io::Error::from_raw_os_error(errno))
 }
 
-/// Executes `target` with `args` under ptrace supervision, optionally streaming events to `trace_path`.
-///
-/// Implements the M2 ptrace lifecycle with persistent V1 binary trace encoding:
-/// 1. Optionally creates output trace file and writes V1 header before fork.
-/// 2. Prepares arguments in parent before fork.
-/// 3. Creates a close-on-exec pipe for error reporting.
-/// 4. In child: PTRACE_TRACEME -> raise(SIGSTOP) -> execvp.
-/// 5. In parent: Observes startup SIGSTOP -> sets PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD -> PTRACE_CONT.
-/// 6. Observes PTRACE_EVENT_EXEC -> transitions to Running -> PTRACE_SYSCALL.
-/// 7. In event loop:
-///    - Consumes initial execve bootstrap exit stop.
-///    - Uses PTRACE_GET_SYSCALL_INFO to classify ENTRY and EXIT phases.
-///    - Pairs syscall entries with exits, prints raw output, and streams to `TraceWriter` if configured.
-///    - Preserves and reinjects ordinary signals using PTRACE_SYSCALL.
-///    - Finalizes trace with completion footer on normal exit or signal termination.
-///    - Reaps the child process.
-pub fn run_tracee(
-    target: &str,
-    args: &[String],
-    trace_path: Option<&Path>,
-) -> Result<TraceeTermination, String> {
-    // If persistent recording is requested, open/truncate output file and write V1 header prior to launch.
-    let mut trace_writer = match trace_path {
-        Some(path) => {
-            let file = File::create(path)
-                .map_err(|e| format!("cannot create trace '{}': {}", path.display(), e))?;
-            let writer = TraceWriter::new(BufWriter::new(file))
-                .map_err(|e| format!("failed to initialize trace header: {}", e))?;
-            Some(writer)
-        }
-        None => None,
+/// Retrieves native x86-64 general-purpose registers via `PTRACE_GETREGS`.
+pub fn get_regs_x86_64(pid: libc::pid_t) -> Result<libc::user_regs_struct, String> {
+    let mut regs = MaybeUninit::<libc::user_regs_struct>::uninit();
+    let res = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGS,
+            pid,
+            ptr::null_mut::<libc::c_void>(),
+            regs.as_mut_ptr() as *mut libc::c_void,
+        )
     };
-
-    let result = run_tracee_inner(target, args, &mut trace_writer);
-
-    if result.is_err() {
-        // If recording failed prematurely, remove incomplete trace file so a corrupt/unfinalized
-        // file is not left presented as a valid trace.
-        if let Some(path) = trace_path {
-            let _ = fs::remove_file(path);
-        }
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!("PTRACE_GETREGS failed for pid {}: {}", pid, err));
     }
-
-    result
+    Ok(unsafe { regs.assume_init() })
 }
 
-fn run_tracee_inner(
-    target: &str,
-    args: &[String],
-    trace_writer: &mut Option<TraceWriter<BufWriter<File>>>,
-) -> Result<TraceeTermination, String> {
+/// Sets native x86-64 general-purpose registers via `PTRACE_SETREGS`.
+pub fn set_regs_x86_64(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Result<(), String> {
+    let res = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGS,
+            pid,
+            ptr::null_mut::<libc::c_void>(),
+            regs as *const libc::user_regs_struct as *const libc::c_void,
+        )
+    };
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!("PTRACE_SETREGS failed for pid {}: {}", pid, err));
+    }
+    Ok(())
+}
+
+/// Retrieves kernel syscall information at a syscall stop via `PTRACE_GET_SYSCALL_INFO`.
+pub fn get_syscall_info(pid: libc::pid_t) -> Result<libc::ptrace_syscall_info, String> {
+    let mut info: MaybeUninit<libc::ptrace_syscall_info> = MaybeUninit::uninit();
+    let get_res = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GET_SYSCALL_INFO,
+            pid,
+            std::mem::size_of::<libc::ptrace_syscall_info>() as *mut libc::c_void,
+            info.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if get_res < 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!(
+            "PTRACE_GET_SYSCALL_INFO failed for pid {}: {}",
+            pid, err
+        ));
+    }
+    Ok(unsafe { info.assume_init() })
+}
+
+/// Reliably sends SIGKILL to a traced child and reaps it completely to avoid zombies or stopped processes.
+pub fn kill_and_reap(pid: libc::pid_t) {
+    unsafe {
+        let _ = libc::kill(pid, libc::SIGKILL);
+        let mut status: libc::c_int = 0;
+        loop {
+            let res = libc::waitpid(pid, &mut status, 0);
+            if res < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                break;
+            }
+        }
+    }
+}
+
+/// Forks and launches `target` with `args` under ptrace supervision up to the post-exec `PTRACE_SYSCALL` state.
+///
+/// Returns the live tracee PID on success, or a descriptive error on failure.
+pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t, String> {
     // 1. Prepare target and arguments as CStrings prior to fork.
-    // This avoids heap allocation and complex runtime code in the child process between fork and exec.
     let c_target = CString::new(target)
         .map_err(|_| format!("target path contains interior null byte: {:?}", target))?;
 
@@ -122,8 +151,6 @@ fn run_tracee_inner(
     c_argv.push(ptr::null());
 
     // 2. Create error reporting pipe with O_CLOEXEC.
-    // If execvp succeeds, the pipe write end is automatically closed by the kernel (producing EOF in parent).
-    // If any step before or during exec fails, child writes LaunchErrorPayload and exits.
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(format!(
@@ -311,8 +338,6 @@ fn run_tracee_inner(
     }
 
     // 5. Configure PTRACE_O_TRACEEXEC and PTRACE_O_TRACESYSGOOD.
-    // PTRACE_O_TRACEEXEC delivers PTRACE_EVENT_EXEC upon successful exec.
-    // PTRACE_O_TRACESYSGOOD sets bit 7 in signal number (SIGTRAP | 0x80) for syscall stops.
     let ptrace_options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
     let opt_res = unsafe {
         libc::ptrace(
@@ -403,7 +428,6 @@ fn run_tracee_inner(
     }
 
     // Positive recognition of successful exec:
-    // With PTRACE_O_TRACEEXEC, wait status must be a stop with SIGTRAP and PTRACE_EVENT_EXEC in upper bits.
     let is_exec_event = libc::WIFSTOPPED(status)
         && libc::WSTOPSIG(status) == libc::SIGTRAP
         && ((status >> 16) as libc::c_int) == libc::PTRACE_EVENT_EXEC;
@@ -419,9 +443,6 @@ fn run_tracee_inner(
             (status >> 16)
         ));
     }
-
-    // Successfully launched! Transition state to Running.
-    state = LaunchState::Running;
 
     // Resume tracee using PTRACE_SYSCALL so all subsequent syscall entry/exit stops are intercepted.
     let cont_res = unsafe {
@@ -440,13 +461,55 @@ fn run_tracee_inner(
         ));
     }
 
+    Ok(pid)
+}
+
+/// Executes `target` with `args` under ptrace supervision, optionally streaming events to `trace_path`.
+pub fn run_tracee(
+    target: &str,
+    args: &[String],
+    trace_path: Option<&Path>,
+) -> Result<TraceeTermination, String> {
+    // If persistent recording is requested, open/truncate output file and write V1 header prior to launch.
+    let mut trace_writer = match trace_path {
+        Some(path) => {
+            let file = File::create(path)
+                .map_err(|e| format!("cannot create trace '{}': {}", path.display(), e))?;
+            let writer = TraceWriter::new(BufWriter::new(file))
+                .map_err(|e| format!("failed to initialize trace header: {}", e))?;
+            Some(writer)
+        }
+        None => None,
+    };
+
+    let result = run_tracee_inner(target, args, &mut trace_writer);
+
+    if result.is_err() {
+        // If recording failed prematurely, remove incomplete trace file so a corrupt/unfinalized
+        // file is not left presented as a valid trace.
+        if let Some(path) = trace_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    result
+}
+
+fn run_tracee_inner(
+    target: &str,
+    args: &[String],
+    trace_writer: &mut Option<TraceWriter<BufWriter<File>>>,
+) -> Result<TraceeTermination, String> {
+    let pid = launch_traced_child(target, args)?;
+    let mut status: libc::c_int = 0;
+
     // Immediately following PTRACE_EVENT_EXEC, the first syscall stop encountered is the EXIT
     // stop corresponding to the initial execve completion. This one-time bootstrap condition
     // is consumed so only target userspace syscalls are reported.
     let mut is_bootstrap_exec_exit = true;
     let mut pending_syscall: Option<PendingSyscall> = None;
 
-    // 7. Main event loop: observe syscall entry/exit stops, stream to writer, preserve signals, detect termination.
+    // Main event loop: observe syscall entry/exit stops, stream to writer, preserve signals, detect termination.
     loop {
         let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
         if wait_res < 0 {
@@ -454,9 +517,10 @@ fn run_tracee_inner(
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
+            kill_and_reap(pid);
             return Err(format!(
-                "waitpid failed in event loop for pid {} in state {:?}: {}",
-                pid, state, err
+                "waitpid failed in event loop for pid {}: {}",
+                pid, err
             ));
         }
 
@@ -487,10 +551,10 @@ fn run_tracee_inner(
             let event = (status >> 16) as u32;
 
             if event != 0 {
-                // In M2, no ptrace events beyond initial exec are supported.
+                kill_and_reap(pid);
                 return Err(format!(
-                    "unexpected ptrace event {} for pid {}: raw status=0x{:x}, stop_sig={}, state={:?}",
-                    event, pid, status, stop_sig, state
+                    "unexpected ptrace event {} for pid {}: raw status=0x{:x}, stop_sig={}",
+                    event, pid, status, stop_sig
                 ));
             }
 
@@ -498,28 +562,19 @@ fn run_tracee_inner(
             let is_syscall_stop = stop_sig == (libc::SIGTRAP | 0x80);
 
             if is_syscall_stop {
-                let mut info: MaybeUninit<libc::ptrace_syscall_info> = MaybeUninit::uninit();
-                let get_res = unsafe {
-                    libc::ptrace(
-                        libc::PTRACE_GET_SYSCALL_INFO,
-                        pid,
-                        std::mem::size_of::<libc::ptrace_syscall_info>() as *mut libc::c_void,
-                        info.as_mut_ptr() as *mut libc::c_void,
-                    )
+                let info = match get_syscall_info(pid) {
+                    Ok(inf) => inf,
+                    Err(e) => {
+                        kill_and_reap(pid);
+                        return Err(e);
+                    }
                 };
-                if get_res < 0 {
-                    let err = io::Error::last_os_error();
-                    return Err(format!(
-                        "PTRACE_GET_SYSCALL_INFO failed for pid {}: {}",
-                        pid, err
-                    ));
-                }
 
-                let info = unsafe { info.assume_init() };
                 match info.op {
                     libc::PTRACE_SYSCALL_INFO_ENTRY => {
                         let entry = unsafe { info.u.entry };
                         if let Some(prev) = pending_syscall {
+                            kill_and_reap(pid);
                             return Err(format!(
                                 "syscall pairing invariant violation for pid {}: received ENTRY nr={} while previous syscall ENTRY nr={} is still pending",
                                 pid, entry.nr, prev.number
@@ -540,6 +595,7 @@ fn run_tracee_inner(
                             writer
                                 .write_syscall_enter(pid as u32, number, args)
                                 .map_err(|e| {
+                                    kill_and_reap(pid);
                                     format!("failed to write SyscallEnter trace event: {}", e)
                                 })?;
                         }
@@ -564,6 +620,7 @@ fn run_tracee_inner(
                                                 exit.sval,
                                             )
                                             .map_err(|e| {
+                                                kill_and_reap(pid);
                                                 format!(
                                                     "failed to write SyscallExit trace event: {}",
                                                     e
@@ -572,6 +629,7 @@ fn run_tracee_inner(
                                     }
                                 }
                                 None => {
+                                    kill_and_reap(pid);
                                     return Err(format!(
                                         "syscall pairing invariant violation for pid {}: received unexpected EXIT (rval={}, is_error={}) with no pending syscall ENTRY",
                                         pid, exit.sval, exit.is_error
@@ -581,6 +639,7 @@ fn run_tracee_inner(
                         }
                     }
                     libc::PTRACE_SYSCALL_INFO_SECCOMP => {
+                        kill_and_reap(pid);
                         return Err(format!(
                             "unsupported seccomp stop for pid {}: nr={}",
                             pid,
@@ -588,12 +647,14 @@ fn run_tracee_inner(
                         ));
                     }
                     libc::PTRACE_SYSCALL_INFO_NONE => {
+                        kill_and_reap(pid);
                         return Err(format!(
                             "tracing invariant violation for pid {}: PTRACE_GET_SYSCALL_INFO returned NONE at syscall stop (status=0x{:x})",
                             pid, status
                         ));
                     }
                     other => {
+                        kill_and_reap(pid);
                         return Err(format!(
                             "unexpected ptrace_syscall_info op {} for pid {}",
                             other, pid
@@ -614,10 +675,8 @@ fn run_tracee_inner(
                     let err = io::Error::last_os_error();
                     // If ESRCH, tracee may have already terminated; continue loop to reap via waitpid.
                     if err.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(format!(
-                            "PTRACE_SYSCALL failed for pid {} in state {:?}: {}",
-                            pid, state, err
-                        ));
+                        kill_and_reap(pid);
+                        return Err(format!("PTRACE_SYSCALL failed for pid {}: {}", pid, err));
                     }
                 }
                 continue;
@@ -637,21 +696,22 @@ fn run_tracee_inner(
                 let err = io::Error::last_os_error();
                 // If ESRCH, tracee may have already terminated; continue loop to reap via waitpid.
                 if err.raw_os_error() != Some(libc::ESRCH) {
+                    kill_and_reap(pid);
                     return Err(format!(
-                        "PTRACE_SYSCALL reinjecting signal {} failed for pid {} in state {:?}: {}",
-                        stop_sig, pid, state, err
+                        "PTRACE_SYSCALL reinjecting signal {} failed for pid {}: {}",
+                        stop_sig, pid, err
                     ));
                 }
             }
             continue;
         }
 
-        // Any other wait status is outside M2 lifecycle model.
+        // Any other wait status is outside lifecycle model.
+        kill_and_reap(pid);
         return Err(format!(
-            "unexpected wait status 0x{:x} for pid {} in state {:?}: WIFCONTINUED={}",
+            "unexpected wait status 0x{:x} for pid {}: WIFCONTINUED={}",
             status,
             pid,
-            state,
             libc::WIFCONTINUED(status)
         ));
     }

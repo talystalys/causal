@@ -2,7 +2,32 @@
 name = "causal"
 version = "0.1.0"
 edition = "2021"
+description = "Deterministic record/replay debugger specializing in asynchronous I/O"
+authors = ["CAUSAL Authors"]
 
 [dependencies]
 libc = "0.2"
-nix = { version = "0.29", features = ["ptrace", "process", "signal", "mman", "uio"] }
+
+[lib]
+name = "causal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "causal"
+path = "src/main.rs"
+
+[[test]]
+name = "m0_lifecycle"
+path = "tests/integration/m0_lifecycle.rs"
+
+[[test]]
+name = "m1_syscalls"
+path = "tests/integration/m1_syscalls.rs"
+
+[[test]]
+name = "m2_trace"
+path = "tests/integration/m2_trace.rs"
+
+[[test]]
+name = "m3_replay"
+path = "tests/integration/m3_replay.rs"
