@@ -17,6 +17,7 @@ echo "Compiling fixtures using ${CC} ${CFLAGS}..."
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/signal_term.c" -o "${BIN_DIR}/signal_term"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/write_hello.c" -o "${BIN_DIR}/write_hello"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/getpid_test.c" -o "${BIN_DIR}/getpid_test"
+"${CC}" ${CFLAGS} "${FIXTURES_DIR}/getpid_replay.c" -o "${BIN_DIR}/getpid_replay"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/raise_sigtrap.c" -o "${BIN_DIR}/raise_sigtrap"
 
 echo "Fixtures built successfully in ${BIN_DIR}."
