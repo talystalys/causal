@@ -1,50 +1,56 @@
 # CURRENT STATUS
 
 ## Current milestone
-M2 — Versioned trace format
+M3 — First deterministic substitution
 
 ## Status
 PASS
 
 ## What works
-* Streaming syscall events (`SyscallEnter`, `SyscallExit`) to persistent V1 binary trace files via `causal record -o <trace> <program> [args...]`.
-* Preserving live console observation mode via `causal record <program> [args...]`.
-* Parsing and dumping trace files via `causal dump <trace>`.
-* Binary wire format V1 with 16-byte header (`CAUSAL\0\0`, version 1, x86-64, little-endian, 64-bit pointer width).
-* Framed event records with 4-byte length prefixes, monotonic 64-bit event IDs, 32-bit TIDs, 6 raw 64-bit syscall arguments, and 64-bit signed return results.
-* 16-byte completion footer (`event_count` + `CAUSEND\0` magic) guaranteeing complete recordings.
-* Comprehensive corruption and validation checks (magic, version, arch, endianness, non-monotonic event IDs, bad record lengths, truncated files, trailing garbage, count mismatches).
-* Automatic cleanup of incomplete trace files on launch failures.
-* Full preservation of M0 and M1 capabilities (signal preservation, exec error pipe, exit code propagation, process reaping).
+* `SYS_getpid` substitution replay prototype via `causal replay <trace> <program> [args...]`.
+* Pre-launch trace validation ensuring single-TID and valid `SYS_getpid` substitution records prior to process fork.
+* Strict syscall event sequence matching (phase, syscall number, event ordering) between live execution and recorded V1 trace.
+* Native x86-64 syscall suppression at ENTRY stop by modifying `orig_rax` to `-1` via `PTRACE_SETREGS`.
+* Verification of `-ENOSYS` (`-38`) suppression sentinel at EXIT stop before value injection.
+* Injected recorded return value into `RAX` at EXIT stop, enabling tracee to observe the recorded PID across differing live PIDs.
+* Passthrough execution of all other non-substituted syscalls against host kernel.
+* Explicit divergence detection (wrong target, out-of-order syscalls, premature termination, extra live events) with reliable process cleanup (`SIGKILL` + reap).
+* Rejection of unexpected signal delivery stops or ptrace events during replay.
+* Full preservation of M0, M1, and M2 features (`record`, `record -o`, `dump`, error pipes, signal preservation during recording).
 
 ## What does not work
-(Non-goals for M2):
-* Deterministic replay / execution replaying.
-* Syscall modification / return value substitution (deferred to M3).
-* Userspace memory payload capture / pointer dereferencing (deferred to M4).
-* Multi-threaded / multi-process tracing.
+(Non-goals for M3):
+* Full deterministic replay of arbitrary programs.
+* Non-getpid syscall substitution (`getppid`, `clock_gettime`, `read`, etc.).
+* Userspace memory output replay / buffer mutation (deferred to M4).
+* Signal delivery recording and replay.
+* Multi-threaded / multi-process replay.
+* Automatic target binary discovery from trace metadata (target binary must be specified explicitly).
 
 ## Known limitations
 * Linux x86-64 single-process, single-threaded native ELF targets only.
-* Raw register representation only (no userspace pointer dereferencing or syscall name database).
-* Traces are specific to format version 1 (unknown versions are rejected).
+* Non-substituted syscalls execute live against host kernel and environment (ASLR addresses and return values may differ across runs).
+* Replay trace must strictly match Trace Format V1.
 
 ## Verification performed
 * `cargo fmt --check` — Passed.
 * `cargo clippy --all-targets -- -D warnings` — Passed (0 warnings).
-* `cargo test` — Passed (34/34 unit and integration tests across M0, M1, and M2 suites).
-* Hexdump / binary layout inspection verifying exact byte offsets and little-endian wire encoding.
-* Synthetic deterministic serialization test confirming byte-for-byte identical encoding.
-* Round-trip record and dump verification for deliberate `write_hello` fixture (`SYS_write`, `fd=1`, `count=6`, `result=6`).
-* CLI corruption testing (bad magic, unsupported version, truncated trace, missing footer, trailing garbage).
-* Automatic cleanup of incomplete trace on launch failure.
-* 100-run record and dump stress test under timeout protection: 100/100 successful iterations.
+* `cargo test` — Passed (40/40 unit and integration tests across M0, M1, M2, and M3 suites).
+* Behavioral proof on `getpid_replay` fixture:
+  * Native run with `CAUSAL_EXPECT_GETPID=<recorded_pid>` exited `42` (live PID != recorded PID).
+  * CAUSAL replay with `CAUSAL_EXPECT_GETPID=<recorded_pid>` exited `0` (recorded PID successfully injected into `RAX`).
+  * Live replay PID differed from recorded PID; pre-injection exit result was verified as `-38` (`-ENOSYS`).
+* Wrong-target divergence testing (`write_hello` against `getpid_replay` trace): cleanly aborted with divergence diagnostic and child reaped.
+* Pre-launch corruption testing: corrupt trace rejected before target fork.
+* 100-run replay stress test against single recorded trace: 100/100 successful iterations.
 
 ## Current architecture
-* `src/main.rs`: CLI dispatcher supporting `record [-o <trace>] <program> [args...]` and `dump <trace>`.
-* `src/trace.rs`: Binary trace format V1 codec, `TraceWriter`, `TraceEvent`, `parse_trace_bytes`, and `dump_trace`.
-* `src/tracer.rs`: Ptrace lifecycle supervisor with live console observation and streaming `TraceWriter` integration.
-* `docs/adr/0001-trace-format-v1.md`: Architecture Decision Record for Trace Format V1.
+* `src/main.rs`: CLI entrypoint handling `record`, `dump`, and `replay`.
+* `src/trace.rs`: Binary Trace Format V1 codec, `TraceWriter`, `read_trace_file`, and `dump_trace`.
+* `src/tracer.rs`: Ptrace supervisor with shared lifecycle helpers (`launch_traced_child`, `kill_and_reap`, `get_regs_x86_64`, `set_regs_x86_64`, `get_syscall_info`).
+* `src/replay.rs`: Deterministic replay engine with event sequence matching, `SYS_getpid` suppression, `-ENOSYS` sentinel validation, and `RAX` return value injection.
+* `docs/adr/0001-trace-format-v1.md`: Trace Format V1 specification.
+* `docs/adr/0002-x86-64-syscall-substitution.md`: x86-64 syscall suppression and return injection design.
 
 ## Next exact task
-M3 — First deterministic substitution
+M4 — Deterministic read replay
