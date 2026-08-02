@@ -31,3 +31,7 @@ path = "tests/integration/m2_trace.rs"
 [[test]]
 name = "m3_replay"
 path = "tests/integration/m3_replay.rs"
+
+[[test]]
+name = "m4_read_replay"
+path = "tests/integration/m4_read_replay.rs"
