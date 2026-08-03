@@ -1,4 +1,4 @@
-use crate::trace::TraceWriter;
+use crate::trace::{TraceWriter, SYS_READ_X86_64};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
@@ -126,6 +126,46 @@ pub fn kill_and_reap(pid: libc::pid_t) {
             }
         }
     }
+}
+
+/// Reads an exact number of bytes from the stopped remote process address space using `process_vm_readv`.
+pub fn read_process_memory_exact(
+    pid: libc::pid_t,
+    remote_addr: u64,
+    len: usize,
+) -> Result<Vec<u8>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = vec![0_u8; len];
+    let local_iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: len,
+    };
+    let remote_iov = libc::iovec {
+        iov_base: remote_addr as *mut libc::c_void,
+        iov_len: len,
+    };
+
+    let nread = unsafe { libc::process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0) };
+
+    if nread < 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!(
+            "process_vm_readv failed for pid {} at 0x{:x} (len={}): {}",
+            pid, remote_addr, len, err
+        ));
+    }
+
+    if (nread as usize) != len {
+        return Err(format!(
+            "process_vm_readv short transfer for pid {}: requested {} bytes, read {}",
+            pid, len, nread
+        ));
+    }
+
+    Ok(buf)
 }
 
 /// Forks and launches `target` with `args` under ptrace supervision up to the post-exec `PTRACE_SYSCALL` state.
@@ -613,7 +653,7 @@ fn run_tracee_inner(
                                         pid, pending.number, exit.sval
                                     );
                                     if let Some(ref mut writer) = trace_writer {
-                                        writer
+                                        let exit_event_id = writer
                                             .write_syscall_exit(
                                                 pid as u32,
                                                 pending.number,
@@ -626,6 +666,37 @@ fn run_tracee_inner(
                                                     e
                                                 )
                                             })?;
+
+                                        if pending.number == SYS_READ_X86_64 && exit.sval > 0 {
+                                            let nbytes = exit.sval as usize;
+                                            let buf_addr = pending.args[1];
+                                            let data = match read_process_memory_exact(
+                                                pid, buf_addr, nbytes,
+                                            ) {
+                                                Ok(d) => d,
+                                                Err(e) => {
+                                                    kill_and_reap(pid);
+                                                    return Err(format!(
+                                                        "failed to capture read memory output for pid {}: {}",
+                                                        pid, e
+                                                    ));
+                                                }
+                                            };
+                                            writer
+                                                .write_kernel_memory_write(
+                                                    pid as u32,
+                                                    exit_event_id,
+                                                    buf_addr,
+                                                    &data,
+                                                )
+                                                .map_err(|e| {
+                                                    kill_and_reap(pid);
+                                                    format!(
+                                                        "failed to write KernelMemoryWrite trace event: {}",
+                                                        e
+                                                    )
+                                                })?;
+                                        }
                                     }
                                 }
                                 None => {
