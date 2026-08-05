@@ -192,24 +192,24 @@ fn test_m3_corrupt_trace_rejected_before_launch() {
 }
 
 #[test]
-fn test_m3_trace_without_getpid_rejected() {
+fn test_m3_trace_without_supported_substitutions_rejected() {
     ensure_fixtures_built();
     let repo_root = get_repo_root();
     let write_fixture = repo_root.join("tests/bin/write_hello");
-    let trace_file = std::env::temp_dir().join("test_m3_no_getpid.causal");
+    let trace_file = std::env::temp_dir().join("test_m3_no_substitutions.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // Record write_hello (which contains no getpid syscall)
-    let rec_out = Command::new(causal_binary())
-        .arg("record")
-        .arg("-o")
-        .arg(&trace_file)
-        .arg(&write_fixture)
-        .output()
+    // Create synthetic trace containing only SYS_write (nr=1)
+    let mut buf = Vec::new();
+    let mut writer = causal::trace::TraceWriter::new_v2(&mut buf).unwrap();
+    writer
+        .write_syscall_enter(100, 1, [1, 0x7ffd_1000, 13, 0, 0, 0])
         .unwrap();
-    assert_eq!(rec_out.status.code(), Some(0));
+    writer.write_syscall_exit(100, 1, 13).unwrap();
+    writer.finish().unwrap();
+    fs::write(&trace_file, &buf).unwrap();
 
-    // Replay write_hello trace against write_hello
+    // Replay trace against write_hello
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -220,8 +220,8 @@ fn test_m3_trace_without_getpid_rejected() {
     assert_eq!(replay_out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&replay_out.stderr);
     assert!(
-        stderr.contains("no supported SYS_getpid substitution"),
-        "must reject trace without getpid: {}",
+        stderr.contains("no supported substitution"),
+        "must reject trace without supported substitutions: {}",
         stderr
     );
 

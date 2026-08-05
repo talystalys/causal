@@ -662,48 +662,87 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                 Some((exit_tid, exit_nr, exit_result, exit_event_id, enter_buf_addr)) => {
                     if exit_tid != *tid {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite tid {} does not match source exit tid {}",
-                                event_id, tid, exit_tid
-                            ));
+                            "trace event {}: KernelMemoryWrite tid {} does not match source exit tid {}",
+                            event_id, tid, exit_tid
+                        ));
                     }
                     if *source_event_id != exit_event_id {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite source_event_id {} does not match immediately preceding exit event {}",
-                                event_id, source_event_id, exit_event_id
-                            ));
+                            "trace event {}: KernelMemoryWrite source_event_id {} does not match immediately preceding exit event {}",
+                            event_id, source_event_id, exit_event_id
+                        ));
                     }
                     if exit_nr != SYS_READ_X86_64 {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite source exit is nr={}, expected SYS_read ({})",
-                                event_id, exit_nr, SYS_READ_X86_64
-                            ));
+                            "trace event {}: KernelMemoryWrite source exit is nr={}, expected SYS_read ({})",
+                            event_id, exit_nr, SYS_READ_X86_64
+                        ));
                     }
                     if exit_result <= 0 {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite attached to non-positive read result {}",
-                                event_id, exit_result
-                            ));
+                            "trace event {}: KernelMemoryWrite attached to non-positive read result {}",
+                            event_id, exit_result
+                        ));
                     }
                     if data.len() != exit_result as usize {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite data length {} does not match read result {}",
-                                event_id,
-                                data.len(),
-                                exit_result
-                            ));
+                            "trace event {}: KernelMemoryWrite data length {} does not match read result {}",
+                            event_id,
+                            data.len(),
+                            exit_result
+                        ));
                     }
                     if *recorded_address != enter_buf_addr {
                         return Err(format!(
-                                "trace event {}: KernelMemoryWrite recorded_address 0x{:x} does not match read entry buffer address 0x{:x}",
-                                event_id, recorded_address, enter_buf_addr
-                            ));
+                            "trace event {}: KernelMemoryWrite recorded_address 0x{:x} does not match read entry buffer address 0x{:x}",
+                            event_id, recorded_address, enter_buf_addr
+                        ));
                     }
                 }
                 None => {
+                    if *event_id > 1 {
+                        let prev_idx = (*event_id as usize) - 2;
+                        if let Some(prev_event) = events.get(prev_idx) {
+                            match prev_event {
+                                TraceEvent::SyscallEnter { .. } => {
+                                    return Err(format!(
+                                        "trace event {}: KernelMemoryWrite source_event_id {} points to a SyscallEnter, expected SyscallExit",
+                                        event_id, source_event_id
+                                    ));
+                                }
+                                TraceEvent::SyscallExit {
+                                    number,
+                                    result,
+                                    event_id: prev_id,
+                                    ..
+                                } => {
+                                    if *number != SYS_READ_X86_64 {
+                                        return Err(format!(
+                                            "trace event {}: KernelMemoryWrite attached to SyscallExit nr={}, expected SYS_read ({})",
+                                            event_id, number, SYS_READ_X86_64
+                                        ));
+                                    }
+                                    if *result == 0 {
+                                        return Err(format!(
+                                            "trace event {}: KernelMemoryWrite attached to zero-result read exit event {}",
+                                            event_id, prev_id
+                                        ));
+                                    }
+                                    if *result < 0 {
+                                        return Err(format!(
+                                            "trace event {}: KernelMemoryWrite attached to failed read exit event {} (result={})",
+                                            event_id, prev_id, result
+                                        ));
+                                    }
+                                }
+                                TraceEvent::KernelMemoryWrite { .. } => {}
+                            }
+                        }
+                    }
                     return Err(format!(
-                            "trace event {}: KernelMemoryWrite does not immediately follow a positive SYS_read exit",
-                            event_id
-                        ));
+                        "trace event {}: KernelMemoryWrite does not immediately follow a positive SYS_read exit",
+                        event_id
+                    ));
                 }
             },
         }

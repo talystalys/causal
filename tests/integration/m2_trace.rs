@@ -154,10 +154,10 @@ fn test_codec_rejection_unsupported_version() {
     let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
     writer.finish().unwrap();
 
-    buf[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&99_u32.to_le_bytes());
     let err = parse_trace_bytes(&buf).unwrap_err();
     assert!(
-        err.contains("unsupported trace format version 2"),
+        err.contains("unsupported trace format version 99"),
         "{}",
         err
     );
