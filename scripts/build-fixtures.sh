@@ -24,5 +24,8 @@ echo "Compiling fixtures using ${CC} ${CFLAGS}..."
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/read_zero_count.c" -o "${BIN_DIR}/read_zero_count"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/read_failed.c" -o "${BIN_DIR}/read_failed"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/raise_sigtrap.c" -o "${BIN_DIR}/raise_sigtrap"
+"${CC}" ${CFLAGS} "${FIXTURES_DIR}/map_model.c" -o "${BIN_DIR}/map_model"
+"${CC}" ${CFLAGS} "${FIXTURES_DIR}/brk_model.c" -o "${BIN_DIR}/brk_model"
+"${CC}" ${CFLAGS} "${FIXTURES_DIR}/map_fail.c" -o "${BIN_DIR}/map_fail"
 
 echo "Fixtures built successfully in ${BIN_DIR}."
