@@ -1,4 +1,8 @@
-use crate::trace::{TraceWriter, SYS_READ_X86_64};
+use crate::maps::{read_process_maps, MemoryMapModel};
+use crate::trace::{
+    TraceWriter, SYS_BRK_X86_64, SYS_MMAP_X86_64, SYS_MPROTECT_X86_64, SYS_MUNMAP_X86_64,
+    SYS_READ_X86_64, TRACE_VERSION_3,
+};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
@@ -548,6 +552,7 @@ fn run_tracee_inner(
     // is consumed so only target userspace syscalls are reported.
     let mut is_bootstrap_exec_exit = true;
     let mut pending_syscall: Option<PendingSyscall> = None;
+    let mut current_map_model: Option<MemoryMapModel> = None;
 
     // Main event loop: observe syscall entry/exit stops, stream to writer, preserve signals, detect termination.
     loop {
@@ -645,6 +650,34 @@ fn run_tracee_inner(
                         if is_bootstrap_exec_exit {
                             // Consume the initial post-exec bootstrap exit stop.
                             is_bootstrap_exec_exit = false;
+
+                            if let Some(ref mut writer) = trace_writer {
+                                if writer.version() >= TRACE_VERSION_3 {
+                                    let initial_maps = match read_process_maps(pid) {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            kill_and_reap(pid);
+                                            return Err(format!(
+                                                "failed to capture initial process maps for pid {}: {}",
+                                                pid, e
+                                            ));
+                                        }
+                                    };
+                                    writer
+                                        .write_memory_map_snapshot(
+                                            pid as u32,
+                                            initial_maps.regions(),
+                                        )
+                                        .map_err(|e| {
+                                            kill_and_reap(pid);
+                                            format!(
+                                                "failed to write MemoryMapSnapshot trace event: {}",
+                                                e
+                                            )
+                                        })?;
+                                    current_map_model = Some(initial_maps);
+                                }
+                            }
                         } else {
                             match pending_syscall.take() {
                                 Some(pending) => {
@@ -696,6 +729,105 @@ fn run_tracee_inner(
                                                         e
                                                     )
                                                 })?;
+                                        }
+
+                                        if (pending.number == SYS_MMAP_X86_64
+                                            || pending.number == SYS_MPROTECT_X86_64
+                                            || pending.number == SYS_MUNMAP_X86_64
+                                            || pending.number == SYS_BRK_X86_64)
+                                            && writer.version() >= TRACE_VERSION_3
+                                        {
+                                            let fresh_maps = match read_process_maps(pid) {
+                                                Ok(m) => m,
+                                                Err(e) => {
+                                                    kill_and_reap(pid);
+                                                    return Err(format!(
+                                                            "failed to read process maps after syscall nr={} for pid {}: {}",
+                                                            pending.number, pid, e
+                                                        ));
+                                                }
+                                            };
+                                            if let Some(ref mut cur_model) = current_map_model {
+                                                let (removes, adds) = cur_model.diff(&fresh_maps);
+
+                                                if (pending.number == SYS_MMAP_X86_64
+                                                    || pending.number == SYS_MPROTECT_X86_64
+                                                    || pending.number == SYS_MUNMAP_X86_64)
+                                                    && exit.sval < 0
+                                                {
+                                                    if !removes.is_empty() || !adds.is_empty() {
+                                                        kill_and_reap(pid);
+                                                        return Err(format!(
+                                                                "failed mapping syscall nr={} (rval={}) produced unexpected map changes",
+                                                                pending.number, exit.sval
+                                                            ));
+                                                    }
+                                                } else {
+                                                    for r in &removes {
+                                                        writer
+                                                                .write_memory_map_remove(
+                                                                    pid as u32,
+                                                                    exit_event_id,
+                                                                    r,
+                                                                )
+                                                                .map_err(|e| {
+                                                                    kill_and_reap(pid);
+                                                                    format!(
+                                                                        "failed to write MemoryMapRemove trace event: {}",
+                                                                        e
+                                                                    )
+                                                                })?;
+                                                    }
+                                                    for a in &adds {
+                                                        writer
+                                                                .write_memory_map_add(
+                                                                    pid as u32,
+                                                                    exit_event_id,
+                                                                    a,
+                                                                )
+                                                                .map_err(|e| {
+                                                                    kill_and_reap(pid);
+                                                                    format!(
+                                                                        "failed to write MemoryMapAdd trace event: {}",
+                                                                        e
+                                                                    )
+                                                                })?;
+                                                    }
+
+                                                    // Self-consistency verification (Section 56)
+                                                    let mut check_model = cur_model.clone();
+                                                    for r in &removes {
+                                                        if let Err(e) = check_model.apply_remove(r)
+                                                        {
+                                                            kill_and_reap(pid);
+                                                            return Err(format!(
+                                                                    "model diff consistency check failed (remove): {}",
+                                                                    e
+                                                                ));
+                                                        }
+                                                    }
+                                                    for a in &adds {
+                                                        if let Err(e) =
+                                                            check_model.apply_add(a.clone())
+                                                        {
+                                                            kill_and_reap(pid);
+                                                            return Err(format!(
+                                                                    "model diff consistency check failed (add): {}",
+                                                                    e
+                                                                ));
+                                                        }
+                                                    }
+                                                    if check_model != fresh_maps {
+                                                        kill_and_reap(pid);
+                                                        return Err(
+                                                                "model diff consistency check failed: reconstructed model does not match fresh observed map"
+                                                                    .to_string(),
+                                                            );
+                                                    }
+
+                                                    *cur_model = fresh_maps;
+                                                }
+                                            }
                                         }
                                     }
                                 }

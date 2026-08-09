@@ -1,3 +1,4 @@
+use crate::maps::{validate_regions_canonical_order, MemoryMapModel, MemoryRegion};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -14,6 +15,9 @@ pub const TRACE_VERSION_1: u32 = 1;
 
 /// Trace format version 2 (with KernelMemoryWrite support).
 pub const TRACE_VERSION_2: u32 = 2;
+
+/// Trace format version 3 (with virtual memory map model support).
+pub const TRACE_VERSION_3: u32 = 3;
 
 /// Architecture ID for Linux x86-64.
 pub const ARCH_X86_64: u16 = 1;
@@ -33,6 +37,15 @@ pub const EVENT_KIND_SYSCALL_EXIT: u8 = 2;
 /// Event kind identifier for KernelMemoryWrite (V2).
 pub const EVENT_KIND_KERNEL_MEMORY_WRITE: u8 = 3;
 
+/// Event kind identifier for MemoryMapSnapshot (V3).
+pub const EVENT_KIND_MEMORY_MAP_SNAPSHOT: u8 = 4;
+
+/// Event kind identifier for MemoryMapAdd (V3).
+pub const EVENT_KIND_MEMORY_MAP_ADD: u8 = 5;
+
+/// Event kind identifier for MemoryMapRemove (V3).
+pub const EVENT_KIND_MEMORY_MAP_REMOVE: u8 = 6;
+
 /// Fixed record length for SyscallEnter (excluding 4-byte length prefix).
 pub const RECORD_LEN_SYSCALL_ENTER: u32 = 72;
 
@@ -42,6 +55,9 @@ pub const RECORD_LEN_SYSCALL_EXIT: u32 = 32;
 /// Fixed header length in body for KernelMemoryWrite (excluding 4-byte length prefix and variable data).
 pub const RECORD_LEN_KERNEL_MEMORY_WRITE_HEADER: u32 = 40;
 
+/// Fixed descriptor length for MemoryRegion header (excluding variable label).
+pub const DESCRIPTOR_LEN_REGION_HEADER: usize = 48;
+
 /// Total size of trace header in bytes.
 pub const HEADER_SIZE: usize = 16;
 
@@ -50,6 +66,10 @@ pub const FOOTER_SIZE: usize = 16;
 
 /// Known Linux x86-64 syscall numbers.
 pub const SYS_READ_X86_64: u64 = 0;
+pub const SYS_MMAP_X86_64: u64 = 9;
+pub const SYS_MPROTECT_X86_64: u64 = 10;
+pub const SYS_MUNMAP_X86_64: u64 = 11;
+pub const SYS_BRK_X86_64: u64 = 12;
 pub const SYS_GETPID_X86_64: u64 = 39;
 pub const SYS_EXIT_X86_64: u64 = 60;
 pub const SYS_EXIT_GROUP_X86_64: u64 = 231;
@@ -76,6 +96,23 @@ pub enum TraceEvent {
         recorded_address: u64,
         data: Vec<u8>,
     },
+    MemoryMapSnapshot {
+        event_id: u64,
+        tid: u32,
+        regions: Vec<MemoryRegion>,
+    },
+    MemoryMapAdd {
+        event_id: u64,
+        tid: u32,
+        source_event_id: u64,
+        region: MemoryRegion,
+    },
+    MemoryMapRemove {
+        event_id: u64,
+        tid: u32,
+        source_event_id: u64,
+        region: MemoryRegion,
+    },
 }
 
 impl TraceEvent {
@@ -84,6 +121,9 @@ impl TraceEvent {
             TraceEvent::SyscallEnter { event_id, .. } => *event_id,
             TraceEvent::SyscallExit { event_id, .. } => *event_id,
             TraceEvent::KernelMemoryWrite { event_id, .. } => *event_id,
+            TraceEvent::MemoryMapSnapshot { event_id, .. } => *event_id,
+            TraceEvent::MemoryMapAdd { event_id, .. } => *event_id,
+            TraceEvent::MemoryMapRemove { event_id, .. } => *event_id,
         }
     }
 
@@ -92,6 +132,9 @@ impl TraceEvent {
             TraceEvent::SyscallEnter { tid, .. } => *tid,
             TraceEvent::SyscallExit { tid, .. } => *tid,
             TraceEvent::KernelMemoryWrite { tid, .. } => *tid,
+            TraceEvent::MemoryMapSnapshot { tid, .. } => *tid,
+            TraceEvent::MemoryMapAdd { tid, .. } => *tid,
+            TraceEvent::MemoryMapRemove { tid, .. } => *tid,
         }
     }
 
@@ -100,6 +143,9 @@ impl TraceEvent {
             TraceEvent::SyscallEnter { number, .. } => Some(*number),
             TraceEvent::SyscallExit { number, .. } => Some(*number),
             TraceEvent::KernelMemoryWrite { .. } => None,
+            TraceEvent::MemoryMapSnapshot { .. } => None,
+            TraceEvent::MemoryMapAdd { .. } => None,
+            TraceEvent::MemoryMapRemove { .. } => None,
         }
     }
 }
@@ -119,7 +165,77 @@ impl std::ops::Deref for ParsedTrace {
     }
 }
 
-/// Streaming trace writer that encodes V1 or V2 binary format directly to an `io::Write` sink.
+/// Helper function to encode a single MemoryRegion descriptor to bytes.
+pub fn encode_region_descriptor(region: &MemoryRegion, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&region.start.to_le_bytes());
+    buf.extend_from_slice(&region.end.to_le_bytes());
+    buf.extend_from_slice(&region.file_offset.to_le_bytes());
+    buf.extend_from_slice(&region.inode.to_le_bytes());
+    buf.extend_from_slice(&region.dev_major.to_le_bytes());
+    buf.extend_from_slice(&region.dev_minor.to_le_bytes());
+    buf.push(region.prot_bits());
+    buf.push(region.sharing_byte());
+    buf.extend_from_slice(&[0_u8; 2]); // reserved = 0
+    let label_len = region.label.len() as u32;
+    buf.extend_from_slice(&label_len.to_le_bytes());
+    buf.extend_from_slice(&region.label);
+}
+
+/// Helper function to decode a single MemoryRegion descriptor from bytes.
+pub fn decode_region_descriptor(bytes: &[u8], offset: &mut usize) -> Result<MemoryRegion, String> {
+    if *offset + DESCRIPTOR_LEN_REGION_HEADER > bytes.len() {
+        return Err("truncated region descriptor header".to_string());
+    }
+    let start = u64::from_le_bytes(bytes[*offset..*offset + 8].try_into().unwrap());
+    let end = u64::from_le_bytes(bytes[*offset + 8..*offset + 16].try_into().unwrap());
+    let file_offset = u64::from_le_bytes(bytes[*offset + 16..*offset + 24].try_into().unwrap());
+    let inode = u64::from_le_bytes(bytes[*offset + 24..*offset + 32].try_into().unwrap());
+    let dev_major = u32::from_le_bytes(bytes[*offset + 32..*offset + 36].try_into().unwrap());
+    let dev_minor = u32::from_le_bytes(bytes[*offset + 36..*offset + 40].try_into().unwrap());
+    let prot_bits = bytes[*offset + 40];
+    let sharing_byte = bytes[*offset + 41];
+    let reserved = &bytes[*offset + 42..*offset + 44];
+    if reserved != [0_u8; 2] {
+        return Err(format!("nonzero descriptor reserved bytes: {:?}", reserved));
+    }
+    if prot_bits > 7 {
+        return Err(format!("invalid prot bits {}", prot_bits));
+    }
+    let prot_read = (prot_bits & 1) != 0;
+    let prot_write = (prot_bits & 2) != 0;
+    let prot_exec = (prot_bits & 4) != 0;
+    let shared = match sharing_byte {
+        1 => false,
+        2 => true,
+        other => return Err(format!("invalid sharing byte {}", other)),
+    };
+    let label_len =
+        u32::from_le_bytes(bytes[*offset + 44..*offset + 48].try_into().unwrap()) as usize;
+    *offset += DESCRIPTOR_LEN_REGION_HEADER;
+    if *offset + label_len > bytes.len() {
+        return Err("label length extends past descriptor boundary".to_string());
+    }
+    let label = bytes[*offset..*offset + label_len].to_vec();
+    *offset += label_len;
+
+    let region = MemoryRegion {
+        start,
+        end,
+        prot_read,
+        prot_write,
+        prot_exec,
+        shared,
+        file_offset,
+        dev_major,
+        dev_minor,
+        inode,
+        label,
+    };
+    region.validate()?;
+    Ok(region)
+}
+
+/// Streaming trace writer that encodes V1, V2, or V3 binary format directly to an `io::Write` sink.
 pub struct TraceWriter<W: Write> {
     writer: W,
     version: u32,
@@ -129,9 +245,9 @@ pub struct TraceWriter<W: Write> {
 }
 
 impl<W: Write> TraceWriter<W> {
-    /// Creates a new `TraceWriter` defaulting to Trace Format V2 for production recording.
+    /// Creates a new `TraceWriter` defaulting to Trace Format V3 for production recording.
     pub fn new(writer: W) -> Result<Self, io::Error> {
-        Self::new_v2(writer)
+        Self::new_v3(writer)
     }
 
     /// Creates a `TraceWriter` explicitly with Version 1 format.
@@ -144,9 +260,14 @@ impl<W: Write> TraceWriter<W> {
         Self::new_with_version(writer, TRACE_VERSION_2)
     }
 
+    /// Creates a `TraceWriter` explicitly with Version 3 format.
+    pub fn new_v3(writer: W) -> Result<Self, io::Error> {
+        Self::new_with_version(writer, TRACE_VERSION_3)
+    }
+
     /// Creates a `TraceWriter` with the specified format version and writes the 16-byte header immediately.
     pub fn new_with_version(mut writer: W, version: u32) -> Result<Self, io::Error> {
-        if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 {
+        if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 && version != TRACE_VERSION_3 {
             return Err(io::Error::other(format!(
                 "unsupported writer trace version: {}",
                 version
@@ -246,7 +367,7 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `KernelMemoryWrite` event record (V2 only).
+    /// Encodes and writes a `KernelMemoryWrite` event record (V2+).
     pub fn write_kernel_memory_write(
         &mut self,
         tid: u32,
@@ -301,6 +422,143 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
+    /// Encodes and writes a `MemoryMapSnapshot` event record (V3+).
+    pub fn write_memory_map_snapshot(
+        &mut self,
+        tid: u32,
+        regions: &[MemoryRegion],
+    ) -> Result<u64, io::Error> {
+        if self.finished {
+            return Err(io::Error::other(
+                "cannot write event to finished trace writer",
+            ));
+        }
+        if self.version < TRACE_VERSION_3 {
+            return Err(io::Error::other(
+                "cannot write MemoryMapSnapshot in trace format V1 or V2",
+            ));
+        }
+
+        let mut descriptors_buf = Vec::new();
+        for r in regions {
+            encode_region_descriptor(r, &mut descriptors_buf);
+        }
+
+        let region_count = u32::try_from(regions.len())
+            .map_err(|_| io::Error::other("region count exceeds u32::MAX"))?;
+        let record_len = 24_u32
+            .checked_add(descriptors_buf.len() as u32)
+            .ok_or_else(|| io::Error::other("record length overflow in MemoryMapSnapshot"))?;
+
+        let event_id = self.next_event_id;
+        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+
+        // 4-byte record length prefix
+        header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
+        // Event header (kind=4 + 3 reserved bytes)
+        header_buf[4] = EVENT_KIND_MEMORY_MAP_SNAPSHOT;
+        header_buf[5..8].copy_from_slice(&[0_u8; 3]);
+        // Event metadata
+        header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
+        header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
+        // Snapshot header
+        header_buf[20..24].copy_from_slice(&region_count.to_le_bytes());
+        header_buf[24..28].copy_from_slice(&0_u32.to_le_bytes()); // reserved = 0
+
+        self.writer.write_all(&header_buf)?;
+        self.writer.write_all(&descriptors_buf)?;
+
+        self.next_event_id += 1;
+        self.event_count += 1;
+        Ok(event_id)
+    }
+
+    /// Encodes and writes a `MemoryMapAdd` event record (V3+).
+    pub fn write_memory_map_add(
+        &mut self,
+        tid: u32,
+        source_event_id: u64,
+        region: &MemoryRegion,
+    ) -> Result<u64, io::Error> {
+        if self.finished {
+            return Err(io::Error::other(
+                "cannot write event to finished trace writer",
+            ));
+        }
+        if self.version < TRACE_VERSION_3 {
+            return Err(io::Error::other(
+                "cannot write MemoryMapAdd in trace format V1 or V2",
+            ));
+        }
+
+        let mut desc_buf = Vec::new();
+        encode_region_descriptor(region, &mut desc_buf);
+
+        let record_len = 24_u32
+            .checked_add(desc_buf.len() as u32)
+            .ok_or_else(|| io::Error::other("record length overflow in MemoryMapAdd"))?;
+
+        let event_id = self.next_event_id;
+        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+
+        header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
+        header_buf[4] = EVENT_KIND_MEMORY_MAP_ADD;
+        header_buf[5..8].copy_from_slice(&[0_u8; 3]);
+        header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
+        header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
+        header_buf[20..28].copy_from_slice(&source_event_id.to_le_bytes());
+
+        self.writer.write_all(&header_buf)?;
+        self.writer.write_all(&desc_buf)?;
+
+        self.next_event_id += 1;
+        self.event_count += 1;
+        Ok(event_id)
+    }
+
+    /// Encodes and writes a `MemoryMapRemove` event record (V3+).
+    pub fn write_memory_map_remove(
+        &mut self,
+        tid: u32,
+        source_event_id: u64,
+        region: &MemoryRegion,
+    ) -> Result<u64, io::Error> {
+        if self.finished {
+            return Err(io::Error::other(
+                "cannot write event to finished trace writer",
+            ));
+        }
+        if self.version < TRACE_VERSION_3 {
+            return Err(io::Error::other(
+                "cannot write MemoryMapRemove in trace format V1 or V2",
+            ));
+        }
+
+        let mut desc_buf = Vec::new();
+        encode_region_descriptor(region, &mut desc_buf);
+
+        let record_len = 24_u32
+            .checked_add(desc_buf.len() as u32)
+            .ok_or_else(|| io::Error::other("record length overflow in MemoryMapRemove"))?;
+
+        let event_id = self.next_event_id;
+        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+
+        header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
+        header_buf[4] = EVENT_KIND_MEMORY_MAP_REMOVE;
+        header_buf[5..8].copy_from_slice(&[0_u8; 3]);
+        header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
+        header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
+        header_buf[20..28].copy_from_slice(&source_event_id.to_le_bytes());
+
+        self.writer.write_all(&header_buf)?;
+        self.writer.write_all(&desc_buf)?;
+
+        self.next_event_id += 1;
+        self.event_count += 1;
+        Ok(event_id)
+    }
+
     /// Writes the 16-byte completion footer and flushes the underlying writer.
     pub fn finish(&mut self) -> Result<(), io::Error> {
         if self.finished {
@@ -342,9 +600,9 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
             .try_into()
             .map_err(|_| "failed to read format version".to_string())?,
     );
-    if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 {
+    if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 && version != TRACE_VERSION_3 {
         return Err(format!(
-            "unsupported trace format version {}; supported versions: 1, 2",
+            "unsupported trace format version {}; supported versions: 1, 2, 3",
             version
         ));
     }
@@ -553,6 +811,127 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
                     data,
                 });
             }
+            EVENT_KIND_MEMORY_MAP_SNAPSHOT => {
+                if version < TRACE_VERSION_3 {
+                    return Err(format!(
+                        "MemoryMapSnapshot event kind 4 is not supported in trace format V{}",
+                        version
+                    ));
+                }
+                if record_len < 24 {
+                    return Err(format!(
+                        "trace event {}: MemoryMapSnapshot record length {} is smaller than minimum header 24",
+                        event_id, record_len
+                    ));
+                }
+                let region_count = u32::from_le_bytes(
+                    record_body[16..20]
+                        .try_into()
+                        .map_err(|_| "failed to read region_count".to_string())?,
+                ) as usize;
+                let reserved = u32::from_le_bytes(
+                    record_body[20..24]
+                        .try_into()
+                        .map_err(|_| "failed to read reserved".to_string())?,
+                );
+                if reserved != 0 {
+                    return Err(format!(
+                        "trace event {}: nonzero reserved in MemoryMapSnapshot: {}",
+                        event_id, reserved
+                    ));
+                }
+
+                let mut desc_offset = 24;
+                let mut regions = Vec::with_capacity(region_count);
+                for _ in 0..region_count {
+                    let region = decode_region_descriptor(record_body, &mut desc_offset)?;
+                    regions.push(region);
+                }
+
+                if desc_offset != record_body.len() {
+                    return Err(format!(
+                        "trace event {}: trailing garbage in MemoryMapSnapshot record (parsed {} bytes, body len {})",
+                        event_id, desc_offset, record_body.len()
+                    ));
+                }
+
+                // Verify regions form a valid canonical snapshot (must already be sorted and non-overlapping)
+                validate_regions_canonical_order(&regions)?;
+
+                events.push(TraceEvent::MemoryMapSnapshot {
+                    event_id,
+                    tid,
+                    regions,
+                });
+            }
+            EVENT_KIND_MEMORY_MAP_ADD => {
+                if version < TRACE_VERSION_3 {
+                    return Err(format!(
+                        "MemoryMapAdd event kind 5 is not supported in trace format V{}",
+                        version
+                    ));
+                }
+                if record_len < 24 + DESCRIPTOR_LEN_REGION_HEADER {
+                    return Err(format!(
+                        "trace event {}: MemoryMapAdd record length {} is smaller than minimum header",
+                        event_id, record_len
+                    ));
+                }
+                let source_event_id = u64::from_le_bytes(
+                    record_body[16..24]
+                        .try_into()
+                        .map_err(|_| "failed to read source_event_id".to_string())?,
+                );
+                let mut desc_offset = 24;
+                let region = decode_region_descriptor(record_body, &mut desc_offset)?;
+                if desc_offset != record_body.len() {
+                    return Err(format!(
+                        "trace event {}: trailing garbage in MemoryMapAdd record",
+                        event_id
+                    ));
+                }
+
+                events.push(TraceEvent::MemoryMapAdd {
+                    event_id,
+                    tid,
+                    source_event_id,
+                    region,
+                });
+            }
+            EVENT_KIND_MEMORY_MAP_REMOVE => {
+                if version < TRACE_VERSION_3 {
+                    return Err(format!(
+                        "MemoryMapRemove event kind 6 is not supported in trace format V{}",
+                        version
+                    ));
+                }
+                if record_len < 24 + DESCRIPTOR_LEN_REGION_HEADER {
+                    return Err(format!(
+                        "trace event {}: MemoryMapRemove record length {} is smaller than minimum header",
+                        event_id, record_len
+                    ));
+                }
+                let source_event_id = u64::from_le_bytes(
+                    record_body[16..24]
+                        .try_into()
+                        .map_err(|_| "failed to read source_event_id".to_string())?,
+                );
+                let mut desc_offset = 24;
+                let region = decode_region_descriptor(record_body, &mut desc_offset)?;
+                if desc_offset != record_body.len() {
+                    return Err(format!(
+                        "trace event {}: trailing garbage in MemoryMapRemove record",
+                        event_id
+                    ));
+                }
+
+                events.push(TraceEvent::MemoryMapRemove {
+                    event_id,
+                    tid,
+                    source_event_id,
+                    region,
+                });
+            }
             other => {
                 return Err(format!("unknown event kind {}", other));
             }
@@ -573,26 +952,69 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
         ));
     }
 
-    // 4. Validate Structural Syscall Pairing and Memory Event Invariants
+    // 4. Validate Structural Syscall Pairing, Memory Events, and V3 Memory Map Invariants
     validate_trace_structure(version, &events)?;
 
     Ok(ParsedTrace { version, events })
 }
 
-/// Validates structural pairing and semantic memory-event invariants.
+/// Validates structural pairing, memory-event invariants, and V3 memory-map model invariants.
 fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), String> {
     let mut pending: HashMap<u32, (u64, [u64; 6], u64)> = HashMap::new();
     // Tracks positive SYS_read exit awaiting its required KernelMemoryWrite: (tid, number, result, exit_event_id, enter_buf_addr)
     let mut pending_read_exit: Option<(u32, u64, i64, u64, u64)> = None;
 
-    for event in events {
+    // V3 map validation state
+    let mut snapshot_seen = false;
+    let mut current_map_model: Option<MemoryMapModel> = None;
+    // Map of exit_event_id -> syscall_number
+    let mut exit_syscall_map: HashMap<u64, u64> = HashMap::new();
+    // Tracks current delta source grouping: Option<(source_event_id, seen_add)>
+    let mut current_delta_group: Option<(u64, bool)> = None;
+    let mut last_syscall_exit_id: Option<u64> = None;
+
+    for (idx, event) in events.iter().enumerate() {
         match event {
+            TraceEvent::MemoryMapSnapshot {
+                event_id, regions, ..
+            } => {
+                last_syscall_exit_id = None;
+                if version < TRACE_VERSION_3 {
+                    return Err(format!(
+                        "MemoryMapSnapshot event in trace format V{}",
+                        version
+                    ));
+                }
+                if snapshot_seen {
+                    return Err(format!(
+                        "duplicate MemoryMapSnapshot event {} in V3 trace",
+                        event_id
+                    ));
+                }
+                if idx != 0 {
+                    return Err(format!(
+                        "MemoryMapSnapshot event {} must be the first event in a V3 trace",
+                        event_id
+                    ));
+                }
+                snapshot_seen = true;
+                current_map_model = Some(MemoryMapModel::from_canonical_regions(regions.clone())?);
+            }
             TraceEvent::SyscallEnter {
                 event_id,
                 tid,
                 number,
                 args,
             } => {
+                current_delta_group = None;
+                last_syscall_exit_id = None;
+                if version >= TRACE_VERSION_3 && !snapshot_seen {
+                    return Err(format!(
+                        "V3 trace missing initial MemoryMapSnapshot before SyscallEnter event {}",
+                        event_id
+                    ));
+                }
+
                 if let Some((_, _, _, prev_exit_id, _)) = pending_read_exit.take() {
                     if version >= TRACE_VERSION_2 {
                         return Err(format!(
@@ -615,6 +1037,10 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                 number,
                 result,
             } => {
+                current_delta_group = None;
+                last_syscall_exit_id = Some(*event_id);
+                exit_syscall_map.insert(*event_id, *number);
+
                 if let Some((_, _, _, prev_exit_id, _)) = pending_read_exit.take() {
                     if version >= TRACE_VERSION_2 {
                         return Err(format!(
@@ -735,7 +1161,7 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                                         ));
                                     }
                                 }
-                                TraceEvent::KernelMemoryWrite { .. } => {}
+                                _ => {}
                             }
                         }
                     }
@@ -745,7 +1171,105 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                     ));
                 }
             },
+            TraceEvent::MemoryMapRemove {
+                event_id,
+                source_event_id,
+                region,
+                ..
+            } => {
+                if last_syscall_exit_id != Some(*source_event_id) {
+                    return Err(format!(
+                        "trace event {}: MemoryMapRemove source_event_id {} is not contiguous with triggering SyscallExit",
+                        event_id, source_event_id
+                    ));
+                }
+
+                let source_nr = match exit_syscall_map.get(source_event_id) {
+                    Some(nr) => *nr,
+                    None => {
+                        return Err(format!(
+                            "trace event {}: MemoryMapRemove source_event_id {} is not an existing SyscallExit",
+                            event_id, source_event_id
+                        ));
+                    }
+                };
+                if source_nr != SYS_MMAP_X86_64
+                    && source_nr != SYS_MPROTECT_X86_64
+                    && source_nr != SYS_MUNMAP_X86_64
+                    && source_nr != SYS_BRK_X86_64
+                {
+                    return Err(format!(
+                        "trace event {}: MemoryMapRemove sourced by non-mapping syscall nr={}",
+                        event_id, source_nr
+                    ));
+                }
+
+                // Check delta group ordering (removes must precede adds for same source)
+                match current_delta_group {
+                    Some((group_source, seen_add)) => {
+                        if group_source != *source_event_id {
+                            current_delta_group = Some((*source_event_id, false));
+                        } else if seen_add {
+                            return Err(format!(
+                                "trace event {}: MemoryMapRemove emitted after MemoryMapAdd for source event {}",
+                                event_id, source_event_id
+                            ));
+                        }
+                    }
+                    None => {
+                        current_delta_group = Some((*source_event_id, false));
+                    }
+                }
+
+                if let Some(model) = current_map_model.as_mut() {
+                    model.apply_remove(region)?;
+                }
+            }
+            TraceEvent::MemoryMapAdd {
+                event_id,
+                source_event_id,
+                region,
+                ..
+            } => {
+                if last_syscall_exit_id != Some(*source_event_id) {
+                    return Err(format!(
+                        "trace event {}: MemoryMapAdd source_event_id {} is not contiguous with triggering SyscallExit",
+                        event_id, source_event_id
+                    ));
+                }
+
+                let source_nr = match exit_syscall_map.get(source_event_id) {
+                    Some(nr) => *nr,
+                    None => {
+                        return Err(format!(
+                            "trace event {}: MemoryMapAdd source_event_id {} is not an existing SyscallExit",
+                            event_id, source_event_id
+                        ));
+                    }
+                };
+                if source_nr != SYS_MMAP_X86_64
+                    && source_nr != SYS_MPROTECT_X86_64
+                    && source_nr != SYS_MUNMAP_X86_64
+                    && source_nr != SYS_BRK_X86_64
+                {
+                    return Err(format!(
+                        "trace event {}: MemoryMapAdd sourced by non-mapping syscall nr={}",
+                        event_id, source_nr
+                    ));
+                }
+
+                // Update delta group
+                current_delta_group = Some((*source_event_id, true));
+
+                if let Some(model) = current_map_model.as_mut() {
+                    model.apply_add(region.clone())?;
+                }
+            }
         }
+    }
+
+    if version >= TRACE_VERSION_3 && !snapshot_seen {
+        return Err("V3 trace is missing required initial MemoryMapSnapshot event".to_string());
     }
 
     if let Some((_, _, _, exit_id, _)) = pending_read_exit {
@@ -758,6 +1282,82 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
     }
 
     Ok(())
+}
+
+/// Reconstructs the historical virtual memory map model immediately after the specified `target_event_id`.
+pub fn reconstruct_maps_at_event(
+    parsed_trace: &ParsedTrace,
+    target_event_id: u64,
+) -> Result<MemoryMapModel, String> {
+    if parsed_trace.version < TRACE_VERSION_3 {
+        return Err(format!(
+            "trace format V{} has no initial memory-map model; record again with V3",
+            parsed_trace.version
+        ));
+    }
+    if target_event_id == 0 {
+        return Err("event-id must be non-zero".to_string());
+    }
+
+    let target_exists = parsed_trace
+        .events
+        .iter()
+        .any(|e| e.event_id() == target_event_id);
+    if !target_exists {
+        return Err(format!(
+            "event-id {} not found in trace (event count: {})",
+            target_event_id,
+            parsed_trace.events.len()
+        ));
+    }
+
+    let mut model: Option<MemoryMapModel> = None;
+
+    for event in &parsed_trace.events {
+        match event {
+            TraceEvent::MemoryMapSnapshot {
+                event_id, regions, ..
+            } => {
+                model = Some(MemoryMapModel::from_canonical_regions(regions.clone())?);
+                if *event_id >= target_event_id {
+                    break;
+                }
+            }
+            TraceEvent::MemoryMapRemove {
+                event_id,
+                source_event_id,
+                region,
+                ..
+            } => {
+                if *event_id <= target_event_id || *source_event_id <= target_event_id {
+                    if let Some(m) = model.as_mut() {
+                        m.apply_remove(region)?;
+                    }
+                }
+            }
+            TraceEvent::MemoryMapAdd {
+                event_id,
+                source_event_id,
+                region,
+                ..
+            } => {
+                if *event_id <= target_event_id || *source_event_id <= target_event_id {
+                    if let Some(m) = model.as_mut() {
+                        m.apply_add(region.clone())?;
+                    }
+                }
+            }
+            TraceEvent::SyscallEnter { event_id, .. }
+            | TraceEvent::SyscallExit { event_id, .. }
+            | TraceEvent::KernelMemoryWrite { event_id, .. } => {
+                if *event_id > target_event_id {
+                    break;
+                }
+            }
+        }
+    }
+
+    model.ok_or_else(|| "trace is missing initial MemoryMapSnapshot event".to_string())
 }
 
 /// Reads a trace file from disk and parses its binary format into a validated `ParsedTrace` object.
@@ -773,7 +1373,7 @@ pub fn read_trace_file_versioned<P: AsRef<Path>>(path: P) -> Result<ParsedTrace,
     parse_trace_bytes(&bytes)
 }
 
-/// Reads a trace file from disk and returns its validated event list (compatible with V1 and V2).
+/// Reads a trace file from disk and returns its validated event list (compatible with V1, V2, and V3).
 pub fn read_trace_file<P: AsRef<Path>>(path: P) -> Result<Vec<TraceEvent>, String> {
     Ok(read_trace_file_versioned(path)?.events)
 }
@@ -827,6 +1427,46 @@ pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
                     recorded_address,
                     data.len(),
                     hex_preview
+                );
+            }
+            TraceEvent::MemoryMapSnapshot {
+                event_id,
+                tid,
+                regions,
+            } => {
+                println!(
+                    "{:06} memory-map-snapshot tid={} regions={}",
+                    event_id,
+                    tid,
+                    regions.len()
+                );
+            }
+            TraceEvent::MemoryMapAdd {
+                event_id,
+                tid,
+                source_event_id,
+                region,
+            } => {
+                println!(
+                    "{:06} memory-map-add    tid={} source={:06} {}",
+                    event_id,
+                    tid,
+                    source_event_id,
+                    region.format_maps_line()
+                );
+            }
+            TraceEvent::MemoryMapRemove {
+                event_id,
+                tid,
+                source_event_id,
+                region,
+            } => {
+                println!(
+                    "{:06} memory-map-remove tid={} source={:06} {}",
+                    event_id,
+                    tid,
+                    source_event_id,
+                    region.format_maps_line()
                 );
             }
         }
