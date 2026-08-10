@@ -32,6 +32,20 @@ enum PendingReplaySyscall {
     },
 }
 
+/// Skips validated V3 map metadata events in the replay cursor.
+fn skip_map_metadata(events: &[TraceEvent], cursor: &mut usize) {
+    while *cursor < events.len() {
+        match &events[*cursor] {
+            TraceEvent::MemoryMapSnapshot { .. }
+            | TraceEvent::MemoryMapAdd { .. }
+            | TraceEvent::MemoryMapRemove { .. } => {
+                *cursor += 1;
+            }
+            _ => break,
+        }
+    }
+}
+
 /// Writes an exact number of bytes into the stopped remote process address space using `process_vm_writev`.
 pub fn write_process_memory_exact(
     pid: libc::pid_t,
@@ -224,6 +238,7 @@ pub fn run_replay(
                     );
                 }
             }
+            skip_map_metadata(&events, &mut cursor);
             if cursor < events.len() {
                 let remaining = events.len() - cursor;
                 let next_id = events[cursor].event_id();
@@ -292,6 +307,8 @@ pub fn run_replay(
                             pid, live_nr
                         ));
                     }
+
+                    skip_map_metadata(&events, &mut cursor);
 
                     if cursor >= events.len() {
                         kill_and_reap(pid);
@@ -492,6 +509,15 @@ pub fn run_replay(
                             return Err(format!(
                                 "replay divergence at recorded event {}: expected KernelMemoryWrite, observed live syscall-enter nr={} (pid={})",
                                 event_id, live_nr, pid
+                            ));
+                        }
+                        TraceEvent::MemoryMapSnapshot { event_id, .. }
+                        | TraceEvent::MemoryMapAdd { event_id, .. }
+                        | TraceEvent::MemoryMapRemove { event_id, .. } => {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "replay divergence at recorded event {}: expected syscall-enter, observed map metadata",
+                                event_id
                             ));
                         }
                     }
@@ -746,6 +772,7 @@ pub fn run_replay(
                             substitutions_performed += 1;
                         }
                         Some(PendingReplaySyscall::Passthrough { number, .. }) => {
+                            skip_map_metadata(&events, &mut cursor);
                             if cursor >= events.len() {
                                 kill_and_reap(pid);
                                 return Err(format!(
@@ -785,6 +812,15 @@ pub fn run_replay(
                                         event_id
                                     ));
                                 }
+                                TraceEvent::MemoryMapSnapshot { event_id, .. }
+                                | TraceEvent::MemoryMapAdd { event_id, .. }
+                                | TraceEvent::MemoryMapRemove { event_id, .. } => {
+                                    kill_and_reap(pid);
+                                    return Err(format!(
+                                        "replay divergence at recorded event {}: expected syscall-exit, observed map metadata",
+                                        event_id
+                                    ));
+                                }
                             }
                         }
                         None => {
@@ -795,6 +831,8 @@ pub fn run_replay(
                             ));
                         }
                     }
+
+                    skip_map_metadata(&events, &mut cursor);
 
                     // Resume with PTRACE_SYSCALL
                     let cont_res = unsafe {
