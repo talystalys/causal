@@ -1,3 +1,4 @@
+pub mod maps;
 pub mod replay;
 pub mod trace;
 pub mod tracer;
@@ -10,6 +11,7 @@ fn print_usage() {
     eprintln!("Usage: causal record [-o <trace>] <program> [args...]");
     eprintln!("       causal dump <trace>");
     eprintln!("       causal replay <trace> <program> [args...]");
+    eprintln!("       causal maps <trace> <event-id>");
 }
 
 fn main() {
@@ -84,6 +86,42 @@ fn main() {
                 }
                 Ok(tracer::TraceeTermination::Signaled(sig)) => {
                     process::exit(128 + sig);
+                }
+                Err(err) => {
+                    eprintln!("causal: {}", err);
+                    process::exit(1);
+                }
+            }
+        }
+        "maps" => {
+            if args.len() != 4 {
+                print_usage();
+                process::exit(2);
+            }
+            let trace_file = &args[2];
+            let event_id_str = &args[3];
+            let event_id: u64 = match event_id_str.parse() {
+                Ok(id) if id > 0 => id,
+                _ => {
+                    eprintln!("causal: invalid event-id '{}'", event_id_str);
+                    process::exit(1);
+                }
+            };
+
+            let parsed = match trace::read_trace_file_versioned(trace_file) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("causal: {}", err);
+                    process::exit(1);
+                }
+            };
+
+            match trace::reconstruct_maps_at_event(&parsed, event_id) {
+                Ok(model) => {
+                    for region in model.regions() {
+                        println!("{}", region.format_maps_line());
+                    }
+                    process::exit(0);
                 }
                 Err(err) => {
                     eprintln!("causal: {}", err);
