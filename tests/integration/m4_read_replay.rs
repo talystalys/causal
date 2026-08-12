@@ -55,9 +55,9 @@ fn test_m4_deleted_source_and_short_read_replay() {
         .expect("record failed");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // 3. Inspect trace: verify V2, SYS_read result=21, and KernelMemoryWrite payload
+    // 3. Inspect trace: verify V2+, SYS_read result=21, and KernelMemoryWrite payload
     let parsed = read_trace_file_versioned(&trace_file).expect("trace parse failed");
-    assert_eq!(parsed.version, TRACE_VERSION_2);
+    assert!(parsed.version >= TRACE_VERSION_2);
 
     let mut found_read_exit = false;
     let mut found_mem_write = false;

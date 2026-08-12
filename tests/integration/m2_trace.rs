@@ -27,7 +27,7 @@ fn causal_binary() -> PathBuf {
 #[test]
 fn test_codec_header_and_empty_trace_round_trip() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     assert_eq!(buf.len(), HEADER_SIZE + FOOTER_SIZE);
@@ -38,7 +38,7 @@ fn test_codec_header_and_empty_trace_round_trip() {
 #[test]
 fn test_codec_syscall_enter_round_trip() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
 
     let args = [1, 2, 3, 4, 5, 0xffff_ffff_ffff_ffff];
     writer
@@ -67,7 +67,7 @@ fn test_codec_syscall_enter_round_trip() {
 #[test]
 fn test_codec_syscall_exit_signed_result_round_trip() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
 
     // Write enter first to satisfy pairing validation
     writer.write_syscall_enter(123, 21, [0; 6]).unwrap();
@@ -95,7 +95,7 @@ fn test_codec_syscall_exit_signed_result_round_trip() {
 #[test]
 fn test_codec_event_ordering_and_ids() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
 
     let id1 = writer.write_syscall_enter(100, 1, [0; 6]).unwrap();
     let id2 = writer.write_syscall_exit(100, 1, 6).unwrap();
@@ -117,7 +117,7 @@ fn test_codec_event_ordering_and_ids() {
 fn test_codec_deterministic_serialization_synthetic() {
     let serialize = || -> Vec<u8> {
         let mut buf = Vec::new();
-        let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+        let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
         writer
             .write_syscall_enter(42, 1, [1, 0x7fff_1234, 6, 0, 0, 0])
             .unwrap();
@@ -140,7 +140,7 @@ fn test_codec_deterministic_serialization_synthetic() {
 #[test]
 fn test_codec_rejection_bad_magic() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     buf[0..8].copy_from_slice(b"BADMAGIC");
@@ -151,7 +151,7 @@ fn test_codec_rejection_bad_magic() {
 #[test]
 fn test_codec_rejection_unsupported_version() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     buf[8..12].copy_from_slice(&99_u32.to_le_bytes());
@@ -166,7 +166,7 @@ fn test_codec_rejection_unsupported_version() {
 #[test]
 fn test_codec_rejection_unsupported_architecture() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     buf[12..14].copy_from_slice(&2_u16.to_le_bytes());
@@ -188,7 +188,7 @@ fn test_codec_rejection_truncated_header() {
 #[test]
 fn test_codec_rejection_missing_footer() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.write_syscall_enter(10, 1, [0; 6]).unwrap();
     // Do not call finish(), so no footer is written
     let err = parse_trace_bytes(&buf).unwrap_err();
@@ -198,7 +198,7 @@ fn test_codec_rejection_missing_footer() {
 #[test]
 fn test_codec_rejection_bad_footer_magic() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     let footer_start = buf.len() - 8;
@@ -210,7 +210,7 @@ fn test_codec_rejection_bad_footer_magic() {
 #[test]
 fn test_codec_rejection_event_count_mismatch() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.write_syscall_enter(10, 231, [0; 6]).unwrap();
     writer.finish().unwrap();
 
@@ -223,7 +223,7 @@ fn test_codec_rejection_event_count_mismatch() {
 #[test]
 fn test_codec_rejection_non_monotonic_event_id() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.write_syscall_enter(10, 1, [0; 6]).unwrap();
     writer.write_syscall_exit(10, 1, 0).unwrap();
     writer.finish().unwrap();
@@ -238,7 +238,7 @@ fn test_codec_rejection_non_monotonic_event_id() {
 #[test]
 fn test_codec_rejection_trailing_garbage() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.finish().unwrap();
 
     buf.extend_from_slice(b"GARBAGE");
@@ -249,7 +249,7 @@ fn test_codec_rejection_trailing_garbage() {
 #[test]
 fn test_codec_rejection_malformed_record_length() {
     let mut buf = Vec::new();
-    let mut writer = causal::trace::TraceWriter::new(&mut buf).unwrap();
+    let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.write_syscall_enter(10, 231, [0; 6]).unwrap();
     writer.finish().unwrap();
 
