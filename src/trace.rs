@@ -19,6 +19,9 @@ pub const TRACE_VERSION_2: u32 = 2;
 /// Trace format version 3 (with virtual memory map model support).
 pub const TRACE_VERSION_3: u32 = 3;
 
+/// Trace format version 4 (with signal delivery and siginfo support).
+pub const TRACE_VERSION_4: u32 = 4;
+
 /// Architecture ID for Linux x86-64.
 pub const ARCH_X86_64: u16 = 1;
 
@@ -46,6 +49,9 @@ pub const EVENT_KIND_MEMORY_MAP_ADD: u8 = 5;
 /// Event kind identifier for MemoryMapRemove (V3).
 pub const EVENT_KIND_MEMORY_MAP_REMOVE: u8 = 6;
 
+/// Event kind identifier for SignalDelivery (V4).
+pub const EVENT_KIND_SIGNAL_DELIVERY: u8 = 7;
+
 /// Fixed record length for SyscallEnter (excluding 4-byte length prefix).
 pub const RECORD_LEN_SYSCALL_ENTER: u32 = 72;
 
@@ -57,6 +63,12 @@ pub const RECORD_LEN_KERNEL_MEMORY_WRITE_HEADER: u32 = 40;
 
 /// Fixed descriptor length for MemoryRegion header (excluding variable label).
 pub const DESCRIPTOR_LEN_REGION_HEADER: usize = 48;
+
+/// Fixed header length in body for SignalDelivery (excluding 4-byte length prefix and siginfo bytes).
+pub const RECORD_LEN_SIGNAL_DELIVERY_HEADER: u32 = 32;
+
+/// Standard x86-64 Linux siginfo_t size in bytes.
+pub const SIGINFO_SIZE_X86_64: usize = 128;
 
 /// Total size of trace header in bytes.
 pub const HEADER_SIZE: usize = 16;
@@ -113,6 +125,14 @@ pub enum TraceEvent {
         source_event_id: u64,
         region: MemoryRegion,
     },
+    SignalDelivery {
+        event_id: u64,
+        tid: u32,
+        signal_number: i32,
+        si_errno: i32,
+        si_code: i32,
+        siginfo_bytes: Vec<u8>,
+    },
 }
 
 impl TraceEvent {
@@ -124,6 +144,7 @@ impl TraceEvent {
             TraceEvent::MemoryMapSnapshot { event_id, .. } => *event_id,
             TraceEvent::MemoryMapAdd { event_id, .. } => *event_id,
             TraceEvent::MemoryMapRemove { event_id, .. } => *event_id,
+            TraceEvent::SignalDelivery { event_id, .. } => *event_id,
         }
     }
 
@@ -135,6 +156,7 @@ impl TraceEvent {
             TraceEvent::MemoryMapSnapshot { tid, .. } => *tid,
             TraceEvent::MemoryMapAdd { tid, .. } => *tid,
             TraceEvent::MemoryMapRemove { tid, .. } => *tid,
+            TraceEvent::SignalDelivery { tid, .. } => *tid,
         }
     }
 
@@ -146,6 +168,7 @@ impl TraceEvent {
             TraceEvent::MemoryMapSnapshot { .. } => None,
             TraceEvent::MemoryMapAdd { .. } => None,
             TraceEvent::MemoryMapRemove { .. } => None,
+            TraceEvent::SignalDelivery { .. } => None,
         }
     }
 }
@@ -235,7 +258,7 @@ pub fn decode_region_descriptor(bytes: &[u8], offset: &mut usize) -> Result<Memo
     Ok(region)
 }
 
-/// Streaming trace writer that encodes V1, V2, or V3 binary format directly to an `io::Write` sink.
+/// Streaming trace writer that encodes V1, V2, V3, or V4 binary format directly to an `io::Write` sink.
 pub struct TraceWriter<W: Write> {
     writer: W,
     version: u32,
@@ -245,9 +268,9 @@ pub struct TraceWriter<W: Write> {
 }
 
 impl<W: Write> TraceWriter<W> {
-    /// Creates a new `TraceWriter` defaulting to Trace Format V3 for production recording.
+    /// Creates a new `TraceWriter` defaulting to Trace Format V4 for production recording.
     pub fn new(writer: W) -> Result<Self, io::Error> {
-        Self::new_v3(writer)
+        Self::new_v4(writer)
     }
 
     /// Creates a `TraceWriter` explicitly with Version 1 format.
@@ -265,9 +288,18 @@ impl<W: Write> TraceWriter<W> {
         Self::new_with_version(writer, TRACE_VERSION_3)
     }
 
+    /// Creates a `TraceWriter` explicitly with Version 4 format.
+    pub fn new_v4(writer: W) -> Result<Self, io::Error> {
+        Self::new_with_version(writer, TRACE_VERSION_4)
+    }
+
     /// Creates a `TraceWriter` with the specified format version and writes the 16-byte header immediately.
     pub fn new_with_version(mut writer: W, version: u32) -> Result<Self, io::Error> {
-        if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 && version != TRACE_VERSION_3 {
+        if version != TRACE_VERSION_1
+            && version != TRACE_VERSION_2
+            && version != TRACE_VERSION_3
+            && version != TRACE_VERSION_4
+        {
             return Err(io::Error::other(format!(
                 "unsupported writer trace version: {}",
                 version
@@ -559,6 +591,63 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
+    /// Encodes and writes a `SignalDelivery` event record (V4+).
+    pub fn write_signal_delivery(
+        &mut self,
+        tid: u32,
+        signal_number: i32,
+        si_errno: i32,
+        si_code: i32,
+        siginfo_bytes: &[u8],
+    ) -> Result<u64, io::Error> {
+        if self.finished {
+            return Err(io::Error::other(
+                "cannot write event to finished trace writer",
+            ));
+        }
+        if self.version < TRACE_VERSION_4 {
+            return Err(io::Error::other(
+                "cannot write SignalDelivery in trace format V1, V2, or V3",
+            ));
+        }
+        if siginfo_bytes.len() != SIGINFO_SIZE_X86_64 {
+            return Err(io::Error::other(format!(
+                "invalid siginfo bytes length {}; expected {}",
+                siginfo_bytes.len(),
+                SIGINFO_SIZE_X86_64
+            )));
+        }
+
+        let siginfo_len = siginfo_bytes.len() as u32;
+        let record_len = RECORD_LEN_SIGNAL_DELIVERY_HEADER
+            .checked_add(siginfo_len)
+            .ok_or_else(|| io::Error::other("record length overflow in SignalDelivery"))?;
+
+        let event_id = self.next_event_id;
+        let mut header_buf = [0_u8; 4 + RECORD_LEN_SIGNAL_DELIVERY_HEADER as usize];
+
+        // 4-byte record length prefix
+        header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
+        // Event header (kind=7 + 3 reserved bytes)
+        header_buf[4] = EVENT_KIND_SIGNAL_DELIVERY;
+        header_buf[5..8].copy_from_slice(&[0_u8; 3]);
+        // Event metadata
+        header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
+        header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
+        // Signal payload header
+        header_buf[20..24].copy_from_slice(&signal_number.to_le_bytes());
+        header_buf[24..28].copy_from_slice(&si_errno.to_le_bytes());
+        header_buf[28..32].copy_from_slice(&si_code.to_le_bytes());
+        header_buf[32..36].copy_from_slice(&siginfo_len.to_le_bytes());
+
+        self.writer.write_all(&header_buf)?;
+        self.writer.write_all(siginfo_bytes)?;
+
+        self.next_event_id += 1;
+        self.event_count += 1;
+        Ok(event_id)
+    }
+
     /// Writes the 16-byte completion footer and flushes the underlying writer.
     pub fn finish(&mut self) -> Result<(), io::Error> {
         if self.finished {
@@ -600,9 +689,13 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
             .try_into()
             .map_err(|_| "failed to read format version".to_string())?,
     );
-    if version != TRACE_VERSION_1 && version != TRACE_VERSION_2 && version != TRACE_VERSION_3 {
+    if version != TRACE_VERSION_1
+        && version != TRACE_VERSION_2
+        && version != TRACE_VERSION_3
+        && version != TRACE_VERSION_4
+    {
         return Err(format!(
-            "unsupported trace format version {}; supported versions: 1, 2, 3",
+            "unsupported trace format version {}; supported versions: 1, 2, 3, 4",
             version
         ));
     }
@@ -930,6 +1023,106 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
                     tid,
                     source_event_id,
                     region,
+                });
+            }
+            EVENT_KIND_SIGNAL_DELIVERY => {
+                if version < TRACE_VERSION_4 {
+                    return Err(format!(
+                        "SignalDelivery event kind 7 is not supported in trace format V{}",
+                        version
+                    ));
+                }
+                if record_len < RECORD_LEN_SIGNAL_DELIVERY_HEADER as usize {
+                    return Err(format!(
+                        "trace event {}: SignalDelivery record length {} is smaller than minimum header {}",
+                        event_id, record_len, RECORD_LEN_SIGNAL_DELIVERY_HEADER
+                    ));
+                }
+                let signal_number = i32::from_le_bytes(
+                    record_body[16..20]
+                        .try_into()
+                        .map_err(|_| "failed to read signal_number".to_string())?,
+                );
+                if signal_number <= 0 || signal_number > 64 {
+                    return Err(format!(
+                        "trace event {}: invalid signal number {}",
+                        event_id, signal_number
+                    ));
+                }
+                let si_errno = i32::from_le_bytes(
+                    record_body[20..24]
+                        .try_into()
+                        .map_err(|_| "failed to read si_errno".to_string())?,
+                );
+                let si_code = i32::from_le_bytes(
+                    record_body[24..28]
+                        .try_into()
+                        .map_err(|_| "failed to read si_code".to_string())?,
+                );
+                let siginfo_len = u32::from_le_bytes(
+                    record_body[28..32]
+                        .try_into()
+                        .map_err(|_| "failed to read siginfo_len".to_string())?,
+                ) as usize;
+
+                if siginfo_len != SIGINFO_SIZE_X86_64 {
+                    return Err(format!(
+                        "trace event {}: invalid siginfo_len {}, expected {}",
+                        event_id, siginfo_len, SIGINFO_SIZE_X86_64
+                    ));
+                }
+                if record_len != (RECORD_LEN_SIGNAL_DELIVERY_HEADER as usize + siginfo_len) {
+                    return Err(format!(
+                        "trace event {}: record length {} does not match 32 + siginfo_len ({})",
+                        event_id, record_len, siginfo_len
+                    ));
+                }
+
+                let siginfo_bytes = record_body[32..32 + siginfo_len].to_vec();
+
+                // Validate raw siginfo common fields match explicit header fields
+                let raw_signo = i32::from_le_bytes(
+                    siginfo_bytes[0..4]
+                        .try_into()
+                        .map_err(|_| "failed to read raw si_signo".to_string())?,
+                );
+                let raw_errno = i32::from_le_bytes(
+                    siginfo_bytes[4..8]
+                        .try_into()
+                        .map_err(|_| "failed to read raw si_errno".to_string())?,
+                );
+                let raw_code = i32::from_le_bytes(
+                    siginfo_bytes[8..12]
+                        .try_into()
+                        .map_err(|_| "failed to read raw si_code".to_string())?,
+                );
+
+                if raw_signo != signal_number {
+                    return Err(format!(
+                        "trace event {}: raw siginfo si_signo {} does not match explicit signal_number {}",
+                        event_id, raw_signo, signal_number
+                    ));
+                }
+                if raw_errno != si_errno {
+                    return Err(format!(
+                        "trace event {}: raw siginfo si_errno {} does not match explicit si_errno {}",
+                        event_id, raw_errno, si_errno
+                    ));
+                }
+                if raw_code != si_code {
+                    return Err(format!(
+                        "trace event {}: raw siginfo si_code {} does not match explicit si_code {}",
+                        event_id, raw_code, si_code
+                    ));
+                }
+
+                events.push(TraceEvent::SignalDelivery {
+                    event_id,
+                    tid,
+                    signal_number,
+                    si_errno,
+                    si_code,
+                    siginfo_bytes,
                 });
             }
             other => {
@@ -1265,11 +1458,32 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                     model.apply_add(region.clone())?;
                 }
             }
+            TraceEvent::SignalDelivery {
+                event_id,
+                signal_number,
+                ..
+            } => {
+                if version >= TRACE_VERSION_3 && !snapshot_seen {
+                    return Err(format!(
+                        "V{} trace missing initial MemoryMapSnapshot before SignalDelivery event {}",
+                        version, event_id
+                    ));
+                }
+                if *signal_number <= 0 || *signal_number > 64 {
+                    return Err(format!(
+                        "trace event {}: invalid signal number {}",
+                        event_id, signal_number
+                    ));
+                }
+            }
         }
     }
 
     if version >= TRACE_VERSION_3 && !snapshot_seen {
-        return Err("V3 trace is missing required initial MemoryMapSnapshot event".to_string());
+        return Err(format!(
+            "V{} trace is missing required initial MemoryMapSnapshot event",
+            version
+        ));
     }
 
     if let Some((_, _, _, exit_id, _)) = pending_read_exit {
@@ -1349,7 +1563,8 @@ pub fn reconstruct_maps_at_event(
             }
             TraceEvent::SyscallEnter { event_id, .. }
             | TraceEvent::SyscallExit { event_id, .. }
-            | TraceEvent::KernelMemoryWrite { event_id, .. } => {
+            | TraceEvent::KernelMemoryWrite { event_id, .. }
+            | TraceEvent::SignalDelivery { event_id, .. } => {
                 if *event_id > target_event_id {
                     break;
                 }
@@ -1373,7 +1588,7 @@ pub fn read_trace_file_versioned<P: AsRef<Path>>(path: P) -> Result<ParsedTrace,
     parse_trace_bytes(&bytes)
 }
 
-/// Reads a trace file from disk and returns its validated event list (compatible with V1, V2, and V3).
+/// Reads a trace file from disk and returns its validated event list (compatible with V1, V2, V3, and V4).
 pub fn read_trace_file<P: AsRef<Path>>(path: P) -> Result<Vec<TraceEvent>, String> {
     Ok(read_trace_file_versioned(path)?.events)
 }
@@ -1467,6 +1682,24 @@ pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
                     tid,
                     source_event_id,
                     region.format_maps_line()
+                );
+            }
+            TraceEvent::SignalDelivery {
+                event_id,
+                tid,
+                signal_number,
+                si_errno,
+                si_code,
+                siginfo_bytes,
+            } => {
+                println!(
+                    "{:06} signal-delivery tid={} sig={} code={} errno={} siginfo_len={}",
+                    event_id,
+                    tid,
+                    signal_number,
+                    si_code,
+                    si_errno,
+                    siginfo_bytes.len()
                 );
             }
         }

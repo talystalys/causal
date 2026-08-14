@@ -39,3 +39,7 @@ path = "tests/integration/m4_read_replay.rs"
 [[test]]
 name = "m5_maps"
 path = "tests/integration/m5_maps.rs"
+
+[[test]]
+name = "m6_signals"
+path = "tests/integration/m6_signals.rs"
