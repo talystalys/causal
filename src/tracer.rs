@@ -111,6 +111,41 @@ pub fn get_syscall_info(pid: libc::pid_t) -> Result<libc::ptrace_syscall_info, S
     Ok(unsafe { info.assume_init() })
 }
 
+/// Retrieves `siginfo_t` for a tracee stopped in a signal-delivery-stop via `PTRACE_GETSIGINFO`.
+pub fn get_signal_info(pid: libc::pid_t) -> Result<libc::siginfo_t, String> {
+    let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+    let res = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETSIGINFO,
+            pid,
+            ptr::null_mut::<libc::c_void>(),
+            info.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!("PTRACE_GETSIGINFO failed for pid {}: {}", pid, err));
+    }
+    Ok(unsafe { info.assume_init() })
+}
+
+/// Sets `siginfo_t` for a tracee stopped in a signal-delivery-stop via `PTRACE_SETSIGINFO`.
+pub fn set_signal_info(pid: libc::pid_t, info: &libc::siginfo_t) -> Result<(), String> {
+    let res = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETSIGINFO,
+            pid,
+            ptr::null_mut::<libc::c_void>(),
+            info as *const libc::siginfo_t as *const libc::c_void,
+        )
+    };
+    if res != 0 {
+        let err = io::Error::last_os_error();
+        return Err(format!("PTRACE_SETSIGINFO failed for pid {}: {}", pid, err));
+    }
+    Ok(())
+}
+
 /// Reliably sends SIGKILL to a traced child and reaps it completely to avoid zombies or stopped processes.
 pub fn kill_and_reap(pid: libc::pid_t) {
     unsafe {
@@ -553,6 +588,7 @@ fn run_tracee_inner(
     let mut is_bootstrap_exec_exit = true;
     let mut pending_syscall: Option<PendingSyscall> = None;
     let mut current_map_model: Option<MemoryMapModel> = None;
+    let mut last_injected_signal: Option<i32> = None;
 
     // Main event loop: observe syscall entry/exit stops, stream to writer, preserve signals, detect termination.
     loop {
@@ -583,6 +619,13 @@ fn run_tracee_inner(
         if libc::WIFSIGNALED(status) {
             let term_sig = libc::WTERMSIG(status);
             if let Some(ref mut writer) = trace_writer {
+                if last_injected_signal != Some(term_sig) {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "pid {} terminated by signal {} with no preceding recorded/injected signal delivery stop",
+                        pid, term_sig
+                    ));
+                }
                 writer
                     .finish()
                     .map_err(|e| format!("failed to finalize trace footer: {}", e))?;
@@ -607,6 +650,7 @@ fn run_tracee_inner(
             let is_syscall_stop = stop_sig == (libc::SIGTRAP | 0x80);
 
             if is_syscall_stop {
+                last_injected_signal = None;
                 let info = match get_syscall_info(pid) {
                     Ok(inf) => inf,
                     Err(e) => {
@@ -885,8 +929,92 @@ fn run_tracee_inner(
                 continue;
             }
 
-            // Ordinary signal-delivery stop (e.g. SIGTERM, plain user SIGTRAP, etc.):
-            // Preserve tracee behavior by reinjecting the signal upon resumption with PTRACE_SYSCALL.
+            // Non-syscall stop: signal-delivery stop, group stop, or fault stop.
+            let siginfo_res = get_signal_info(pid);
+
+            let info = match siginfo_res {
+                Ok(inf) => inf,
+                Err(e) => {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "pid {}: failed to retrieve siginfo for signal stop {} (possible group-stop or invalid ptrace state): {}",
+                        pid, stop_sig, e
+                    ));
+                }
+            };
+
+            // Validate that si_signo matches the observed stop signal
+            if info.si_signo != stop_sig {
+                kill_and_reap(pid);
+                return Err(format!(
+                    "pid {}: siginfo si_signo {} does not match stop signal {}",
+                    pid, info.si_signo, stop_sig
+                ));
+            }
+
+            if let Some(ref mut writer) = trace_writer {
+                // Persistent recording mode: validate determinism constraints
+
+                // Group-stops and stopping signals are unsupported in deterministic recording
+                let unsupported_stopping_signals = [
+                    libc::SIGKILL,
+                    libc::SIGSTOP,
+                    libc::SIGTSTP,
+                    libc::SIGTTIN,
+                    libc::SIGTTOU,
+                    libc::SIGCONT,
+                ];
+                if unsupported_stopping_signals.contains(&stop_sig) {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "pid {}: signal {} is unsupported in M6 deterministic recording",
+                        pid, stop_sig
+                    ));
+                }
+
+                // Verify si_code is within supported deterministic classes (SI_USER = 0, SI_TKILL = -6)
+                if info.si_code != libc::SI_USER && info.si_code != libc::SI_TKILL {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "pid {}: signal {} with unsupported si_code {} is outside M6 supported deterministic class (only SI_USER and SI_TKILL are supported)",
+                        pid, stop_sig, info.si_code
+                    ));
+                }
+
+                // If bootstrap execve exit hasn't happened yet, signal delivery is invalid
+                if is_bootstrap_exec_exit {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "pid {}: signal {} delivered before initial bootstrap MemoryMapSnapshot",
+                        pid, stop_sig
+                    ));
+                }
+
+                let raw_siginfo: [u8; std::mem::size_of::<libc::siginfo_t>()] =
+                    unsafe { std::mem::transmute(info) };
+
+                writer
+                    .write_signal_delivery(
+                        pid as u32,
+                        stop_sig,
+                        info.si_errno,
+                        info.si_code,
+                        &raw_siginfo,
+                    )
+                    .map_err(|e| {
+                        kill_and_reap(pid);
+                        format!("failed to write SignalDelivery trace event: {}", e)
+                    })?;
+
+                println!(
+                    "signal-delivery tid={} sig={} code={} errno={}",
+                    pid, stop_sig, info.si_code, info.si_errno
+                );
+
+                last_injected_signal = Some(stop_sig);
+            }
+
+            // Reinject signal into tracee upon resumption
             let cont_res = unsafe {
                 libc::ptrace(
                     libc::PTRACE_SYSCALL,
