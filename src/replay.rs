@@ -1,10 +1,11 @@
 use crate::trace::{read_trace_file_versioned, TraceEvent, TRACE_VERSION_2};
 pub use crate::trace::{SYS_GETPID_X86_64, SYS_READ_X86_64};
 use crate::tracer::{
-    get_regs_x86_64, get_syscall_info, kill_and_reap, launch_traced_child, set_regs_x86_64,
-    TraceeTermination,
+    get_regs_x86_64, get_signal_info, get_syscall_info, kill_and_reap, launch_traced_child,
+    set_regs_x86_64, set_signal_info, TraceeTermination,
 };
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr;
 
@@ -44,6 +45,64 @@ fn skip_map_metadata(events: &[TraceEvent], cursor: &mut usize) {
             _ => break,
         }
     }
+}
+
+/// Arms the next recorded signal delivery via `tgkill` while the tracee is stopped,
+/// without advancing the replay trace cursor.
+fn arm_next_recorded_signal_if_needed(
+    events: &[TraceEvent],
+    mut cursor: usize,
+    pid: libc::pid_t,
+    armed: &mut Option<u64>,
+) -> Result<(), String> {
+    if armed.is_some() {
+        return Ok(());
+    }
+
+    skip_map_metadata(events, &mut cursor);
+    if cursor >= events.len() {
+        return Ok(());
+    }
+
+    if let TraceEvent::SignalDelivery {
+        event_id,
+        signal_number,
+        si_code,
+        ..
+    } = &events[cursor]
+    {
+        if *si_code != libc::SI_USER && *si_code != libc::SI_TKILL {
+            return Err(format!(
+                "replay error at event {}: signal {} with unsupported si_code {} is outside M6 supported deterministic class",
+                event_id, signal_number, si_code
+            ));
+        }
+        let forbidden = [
+            libc::SIGKILL,
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGCONT,
+        ];
+        if forbidden.contains(signal_number) {
+            return Err(format!(
+                "replay error at event {}: signal {} is unsupported in M6 deterministic replay",
+                event_id, signal_number
+            ));
+        }
+
+        let res = unsafe { libc::tgkill(pid, pid, *signal_number) };
+        if res != 0 {
+            let err = io::Error::last_os_error();
+            return Err(format!(
+                "tgkill failed to queue signal {} to pid {}: {}",
+                signal_number, pid, err
+            ));
+        }
+        *armed = Some(*event_id);
+    }
+    Ok(())
 }
 
 /// Writes an exact number of bytes into the stopped remote process address space using `process_vm_writev`.
@@ -102,7 +161,7 @@ pub fn run_replay(
     let events = parsed_trace.events;
 
     if events.is_empty() {
-        return Err("M4 replay trace contains no events".to_string());
+        return Err("replay trace contains no events".to_string());
     }
 
     // 2. Validate prerequisites
@@ -110,37 +169,57 @@ pub fn run_replay(
     for event in &events {
         if event.tid() != recorded_tid {
             return Err(
-                "M4 replay does not support multi-threaded trace with multiple TIDs".to_string(),
+                "replay does not support multi-threaded trace with multiple TIDs".to_string(),
             );
         }
     }
 
-    let mut supported_substitutions_found = 0;
+    let mut supported_features_found = 0;
     for event in &events {
-        if let TraceEvent::SyscallExit { number, result, .. } = event {
-            if *number == SYS_GETPID_X86_64 {
-                if *result <= 0 || *result > (i32::MAX as i64) {
-                    return Err(format!(
-                        "M4 replay trace contains invalid recorded getpid result {}",
-                        result
-                    ));
+        match event {
+            TraceEvent::SyscallExit { number, result, .. } => {
+                if *number == SYS_GETPID_X86_64 {
+                    if *result <= 0 || *result > (i32::MAX as i64) {
+                        return Err(format!(
+                            "replay trace contains invalid recorded getpid result {}",
+                            result
+                        ));
+                    }
+                    supported_features_found += 1;
+                } else if *number == SYS_READ_X86_64 {
+                    if version < TRACE_VERSION_2 && *result > 0 {
+                        return Err(
+                            "V1 trace cannot replay SYS_read memory output; record again with Trace Format V2"
+                                .to_string(),
+                        );
+                    }
+                    supported_features_found += 1;
                 }
-                supported_substitutions_found += 1;
-            } else if *number == SYS_READ_X86_64 {
-                if version < TRACE_VERSION_2 && *result > 0 {
-                    return Err(
-                        "V1 trace cannot replay SYS_read memory output; record again with Trace Format V2"
-                            .to_string(),
-                    );
-                }
-                supported_substitutions_found += 1;
             }
+            TraceEvent::SignalDelivery {
+                signal_number,
+                si_code,
+                ..
+            } if *si_code == libc::SI_USER || *si_code == libc::SI_TKILL => {
+                let forbidden = [
+                    libc::SIGKILL,
+                    libc::SIGSTOP,
+                    libc::SIGTSTP,
+                    libc::SIGTTIN,
+                    libc::SIGTTOU,
+                    libc::SIGCONT,
+                ];
+                if !forbidden.contains(signal_number) {
+                    supported_features_found += 1;
+                }
+            }
+            _ => {}
         }
     }
 
-    if supported_substitutions_found == 0 {
+    if supported_features_found == 0 {
         return Err(
-            "M4 replay trace contains no supported substitution (SYS_getpid or SYS_read)"
+            "replay trace contains no supported substitution (SYS_getpid, SYS_read, or SignalDelivery)"
                 .to_string(),
         );
     }
@@ -184,6 +263,23 @@ pub fn run_replay(
         ));
     }
 
+    let mut cursor: usize = 0;
+    let mut pending_syscall: Option<PendingReplaySyscall> = None;
+    let mut substitutions_performed: usize = 0;
+    let mut armed_signal_event: Option<u64> = None;
+    let mut last_injected_signal: Option<i32> = None;
+
+    // Skip initial snapshot metadata if present
+    skip_map_metadata(&events, &mut cursor);
+
+    // Arm next signal before initial resume if SignalDelivery is the first execution event
+    if let Err(e) =
+        arm_next_recorded_signal_if_needed(&events, cursor, pid, &mut armed_signal_event)
+    {
+        kill_and_reap(pid);
+        return Err(e);
+    }
+
     // Resume tracee to enter main replay loop
     let cont_res = unsafe {
         libc::ptrace(
@@ -203,10 +299,6 @@ pub fn run_replay(
     }
 
     // 5. Main replay loop
-    let mut cursor: usize = 0;
-    let mut pending_syscall: Option<PendingReplaySyscall> = None;
-    let mut substitutions_performed: usize = 0;
-
     loop {
         let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
         if wait_res < 0 {
@@ -251,7 +343,7 @@ pub fn run_replay(
             if substitutions_performed == 0 {
                 kill_and_reap(pid);
                 return Err(
-                    "replay failed: no substitution was performed during execution".to_string(),
+                    "replay failed: no substitution or signal delivery was performed during execution".to_string(),
                 );
             }
             return Ok(TraceeTermination::Exited(exit_code));
@@ -259,10 +351,14 @@ pub fn run_replay(
 
         if libc::WIFSIGNALED(status) {
             let term_sig = libc::WTERMSIG(status);
+            skip_map_metadata(&events, &mut cursor);
+            if cursor >= events.len() && last_injected_signal == Some(term_sig) {
+                return Ok(TraceeTermination::Signaled(term_sig));
+            }
             kill_and_reap(pid);
             return Err(format!(
-                "replay divergence: tracee terminated unexpectedly by signal {}",
-                term_sig
+                "replay divergence: tracee terminated unexpectedly by signal {} (last_injected_signal={:?}, cursor={}/{})",
+                term_sig, last_injected_signal, cursor, events.len()
             ));
         }
 
@@ -280,12 +376,167 @@ pub fn run_replay(
 
             let is_syscall_stop = stop_sig == (libc::SIGTRAP | 0x80);
             if !is_syscall_stop {
-                kill_and_reap(pid);
-                return Err(format!(
-                    "replay divergence: unexpected signal delivery stop (sig={}) on pid {} during replay; signal replay is unsupported in M4",
-                    stop_sig, pid
-                ));
+                // Signal delivery stop in replay!
+                let info = match get_signal_info(pid) {
+                    Ok(inf) => inf,
+                    Err(e) => {
+                        kill_and_reap(pid);
+                        return Err(format!(
+                            "replay divergence on pid {}: failed to retrieve siginfo for signal stop {} (possible group-stop): {}",
+                            pid, stop_sig, e
+                        ));
+                    }
+                };
+
+                skip_map_metadata(&events, &mut cursor);
+
+                if cursor >= events.len() {
+                    kill_and_reap(pid);
+                    return Err(format!(
+                        "replay divergence: unexpected live signal delivery stop (sig={}, code={}) on pid {} after trace exhausted",
+                        stop_sig, info.si_code, pid
+                    ));
+                }
+
+                let rec_ev = &events[cursor];
+                match rec_ev {
+                    TraceEvent::SignalDelivery {
+                        event_id,
+                        signal_number,
+                        si_errno,
+                        si_code,
+                        siginfo_bytes,
+                        ..
+                    } => {
+                        if stop_sig != *signal_number {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "replay divergence at recorded event {}: expected signal {}, observed live stop signal {}",
+                                event_id, signal_number, stop_sig
+                            ));
+                        }
+
+                        if info.si_signo != stop_sig {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "replay divergence at recorded event {}: live siginfo si_signo {} does not match stop signal {}",
+                                event_id, info.si_signo, stop_sig
+                            ));
+                        }
+
+                        if let Some(armed_id) = armed_signal_event {
+                            if armed_id != *event_id {
+                                kill_and_reap(pid);
+                                return Err(format!(
+                                    "replay divergence: armed event {} does not match current event {}",
+                                    armed_id, event_id
+                                ));
+                            }
+                        }
+
+                        // Restore recorded siginfo via PTRACE_SETSIGINFO
+                        let mut restored_info = MaybeUninit::<libc::siginfo_t>::zeroed();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                siginfo_bytes.as_ptr(),
+                                restored_info.as_mut_ptr() as *mut u8,
+                                siginfo_bytes
+                                    .len()
+                                    .min(std::mem::size_of::<libc::siginfo_t>()),
+                            );
+                        }
+                        let restored_info = unsafe { restored_info.assume_init() };
+
+                        if let Err(e) = set_signal_info(pid, &restored_info) {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "failed to restore siginfo for event {} on pid {}: {}",
+                                event_id, pid, e
+                            ));
+                        }
+
+                        // Verify restoration with PTRACE_GETSIGINFO
+                        let post_check = match get_signal_info(pid) {
+                            Ok(inf) => inf,
+                            Err(e) => {
+                                kill_and_reap(pid);
+                                return Err(format!(
+                                    "failed to verify siginfo restoration for event {} on pid {}: {}",
+                                    event_id, pid, e
+                                ));
+                            }
+                        };
+
+                        if post_check.si_signo != *signal_number
+                            || post_check.si_code != *si_code
+                            || post_check.si_errno != *si_errno
+                        {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "replay verification failed for event {}: restored siginfo (signo={}, code={}, errno={}) does not match recorded (signo={}, code={}, errno={})",
+                                event_id,
+                                post_check.si_signo,
+                                post_check.si_code,
+                                post_check.si_errno,
+                                signal_number,
+                                si_code,
+                                si_errno
+                            ));
+                        }
+
+                        eprintln!(
+                            "replay-signal event={} sig={} generated_code={} recorded_code={} siginfo_restored=true injected={}",
+                            event_id, signal_number, info.si_code, si_code, signal_number
+                        );
+
+                        cursor += 1;
+                        armed_signal_event = None;
+                        last_injected_signal = Some(*signal_number);
+                        substitutions_performed += 1;
+
+                        skip_map_metadata(&events, &mut cursor);
+
+                        if let Err(e) = arm_next_recorded_signal_if_needed(
+                            &events,
+                            cursor,
+                            pid,
+                            &mut armed_signal_event,
+                        ) {
+                            kill_and_reap(pid);
+                            return Err(e);
+                        }
+
+                        let cont_res = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_SYSCALL,
+                                pid,
+                                ptr::null_mut::<libc::c_void>(),
+                                ptr::null_mut::<libc::c_void>().add(*signal_number as usize),
+                            )
+                        };
+                        if cont_res != 0 {
+                            let err = io::Error::last_os_error();
+                            if err.raw_os_error() != Some(libc::ESRCH) {
+                                kill_and_reap(pid);
+                                return Err(format!(
+                                    "PTRACE_SYSCALL reinjecting signal {} failed for pid {}: {}",
+                                    signal_number, pid, err
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    other => {
+                        kill_and_reap(pid);
+                        return Err(format!(
+                            "replay divergence at recorded event {}: expected non-signal event, observed unrecorded live signal delivery stop (sig={}, code={})",
+                            other.event_id(), stop_sig, info.si_code
+                        ));
+                    }
+                }
             }
+
+            last_injected_signal = None;
 
             let info = match get_syscall_info(pid) {
                 Ok(inf) => inf,
@@ -520,6 +771,25 @@ pub fn run_replay(
                                 event_id
                             ));
                         }
+                        TraceEvent::SignalDelivery { event_id, .. } => {
+                            kill_and_reap(pid);
+                            return Err(format!(
+                                "replay divergence at recorded event {}: expected SignalDelivery, observed live syscall-enter nr={} (pid={})",
+                                event_id, live_nr, pid
+                            ));
+                        }
+                    }
+
+                    skip_map_metadata(&events, &mut cursor);
+
+                    if let Err(e) = arm_next_recorded_signal_if_needed(
+                        &events,
+                        cursor,
+                        pid,
+                        &mut armed_signal_event,
+                    ) {
+                        kill_and_reap(pid);
+                        return Err(e);
                     }
 
                     // Resume with PTRACE_SYSCALL
@@ -821,6 +1091,13 @@ pub fn run_replay(
                                         event_id
                                     ));
                                 }
+                                TraceEvent::SignalDelivery { event_id, .. } => {
+                                    kill_and_reap(pid);
+                                    return Err(format!(
+                                        "replay divergence at recorded event {}: expected SignalDelivery, observed live syscall-exit nr={} (pid={})",
+                                        event_id, number, pid
+                                    ));
+                                }
                             }
                         }
                         None => {
@@ -833,6 +1110,16 @@ pub fn run_replay(
                     }
 
                     skip_map_metadata(&events, &mut cursor);
+
+                    if let Err(e) = arm_next_recorded_signal_if_needed(
+                        &events,
+                        cursor,
+                        pid,
+                        &mut armed_signal_event,
+                    ) {
+                        kill_and_reap(pid);
+                        return Err(e);
+                    }
 
                     // Resume with PTRACE_SYSCALL
                     let cont_res = unsafe {
