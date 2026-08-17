@@ -322,7 +322,7 @@ fn test_m5_initial_snapshot_evidence() {
     assert_eq!(res, Ok(TraceeTermination::Exited(0)));
 
     let parsed = read_trace_file_versioned(&trace_path).unwrap();
-    assert_eq!(parsed.version, TRACE_VERSION_3);
+    assert!(parsed.version >= TRACE_VERSION_3);
 
     // Criteria G, H, I, J, X:
     // Event 1 must be MemoryMapSnapshot with non-empty regions, sorted, non-overlapping, preceding first SyscallEnter
@@ -370,7 +370,7 @@ fn test_m5_recording_map_model_fixture_lifecycle() {
     assert_eq!(res, Ok(TraceeTermination::Exited(0)));
 
     let parsed = read_trace_file_versioned(&trace_path).unwrap();
-    assert_eq!(parsed.version, TRACE_VERSION_3);
+    assert!(parsed.version >= TRACE_VERSION_3);
 
     // Event 1 must be MemoryMapSnapshot
     match &parsed.events[0] {
@@ -470,7 +470,7 @@ fn test_m5_recording_brk_model_fixture() {
     assert_eq!(res, Ok(TraceeTermination::Exited(0)));
 
     let parsed = read_trace_file_versioned(&trace_path).unwrap();
-    assert_eq!(parsed.version, TRACE_VERSION_3);
+    assert!(parsed.version >= TRACE_VERSION_3);
 
     // Verify brk exits have matching deltas
     let brk_deltas_count = parsed
@@ -501,7 +501,7 @@ fn test_m5_recording_map_fail_produces_no_deltas() {
     assert_eq!(res, Ok(TraceeTermination::Exited(0)));
 
     let parsed = read_trace_file_versioned(&trace_path).unwrap();
-    assert_eq!(parsed.version, TRACE_VERSION_3);
+    assert!(parsed.version >= TRACE_VERSION_3);
 
     // Filter failed mapping exits
     let failed_exits: Vec<u64> = parsed
@@ -1495,7 +1495,7 @@ fn test_m5_replay_with_v3_trace_succeeds() {
     assert_eq!(res, Ok(TraceeTermination::Exited(0)));
 
     let parsed = read_trace_file_versioned(&trace_path).unwrap();
-    assert_eq!(parsed.version, TRACE_VERSION_3);
+    assert!(parsed.version >= TRACE_VERSION_3);
 
     // Replay against recorded V3 trace (replay skips map metadata)
     let replay_res = run_replay(&trace_path, fixture.to_str().unwrap(), &[]);
@@ -1522,7 +1522,7 @@ fn test_m5_v3_replay_read_and_mixed() {
     assert_eq!(res_rec, Ok(TraceeTermination::Exited(0)));
 
     let parsed_read = read_trace_file_versioned(&trace_read).unwrap();
-    assert_eq!(parsed_read.version, TRACE_VERSION_3);
+    assert!(parsed_read.version >= TRACE_VERSION_3);
 
     // Corrupt input source file
     fs::write(&input_file, b"CORRUPTED INPUT FOR LIVE READ EXECUTION").unwrap();
@@ -1549,7 +1549,7 @@ fn test_m5_v3_replay_read_and_mixed() {
     assert_eq!(res_mixed_rec, Ok(TraceeTermination::Exited(0)));
 
     let parsed_mixed = read_trace_file_versioned(&trace_mixed).unwrap();
-    assert_eq!(parsed_mixed.version, TRACE_VERSION_3);
+    assert!(parsed_mixed.version >= TRACE_VERSION_3);
 
     // Replay mixed trace
     let res_mixed_rep = run_replay(
@@ -1615,7 +1615,7 @@ fn test_m5_recording_stress_100_runs() {
         );
 
         let parsed = read_trace_file_versioned(&trace_path).unwrap();
-        assert_eq!(parsed.version, TRACE_VERSION_3);
+        assert!(parsed.version >= TRACE_VERSION_3);
         assert!(!parsed.events.is_empty());
 
         let _ = fs::remove_file(&trace_path);

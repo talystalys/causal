@@ -1463,6 +1463,18 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                 signal_number,
                 ..
             } => {
+                current_delta_group = None;
+                last_syscall_exit_id = None;
+
+                if let Some((_, _, _, prev_exit_id, _)) = pending_read_exit.take() {
+                    if version >= TRACE_VERSION_2 {
+                        return Err(format!(
+                            "SignalDelivery event {} interposes before required KernelMemoryWrite for positive SYS_read exit {}",
+                            event_id, prev_exit_id
+                        ));
+                    }
+                }
+
                 if version >= TRACE_VERSION_3 && !snapshot_seen {
                     return Err(format!(
                         "V{} trace missing initial MemoryMapSnapshot before SignalDelivery event {}",

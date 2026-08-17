@@ -197,10 +197,17 @@ pub fn run_replay(
                 }
             }
             TraceEvent::SignalDelivery {
+                event_id,
                 signal_number,
                 si_code,
                 ..
-            } if *si_code == libc::SI_USER || *si_code == libc::SI_TKILL => {
+            } => {
+                if *si_code != libc::SI_USER && *si_code != libc::SI_TKILL {
+                    return Err(format!(
+                        "replay error at event {}: signal {} with unsupported si_code {} is outside M6 supported deterministic class",
+                        event_id, signal_number, si_code
+                    ));
+                }
                 let forbidden = [
                     libc::SIGKILL,
                     libc::SIGSTOP,
@@ -209,9 +216,46 @@ pub fn run_replay(
                     libc::SIGTTOU,
                     libc::SIGCONT,
                 ];
-                if !forbidden.contains(signal_number) {
-                    supported_features_found += 1;
+                if forbidden.contains(signal_number) {
+                    return Err(format!(
+                        "replay error at event {}: signal {} is unsupported in M6 deterministic replay",
+                        event_id, signal_number
+                    ));
                 }
+                supported_features_found += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Reject signal delivery interposed inside substituted SYS_getpid or SYS_read pairs
+    let mut pending_subst_enter: Option<(u64, u64)> = None;
+    for event in &events {
+        match event {
+            TraceEvent::SyscallEnter {
+                event_id, number, ..
+            } => {
+                if *number == SYS_GETPID_X86_64 || *number == SYS_READ_X86_64 {
+                    pending_subst_enter = Some((*event_id, *number));
+                } else {
+                    pending_subst_enter = None;
+                }
+            }
+            TraceEvent::SignalDelivery { event_id, .. } => {
+                if let Some((enter_id, nr)) = pending_subst_enter {
+                    let name = if nr == SYS_GETPID_X86_64 {
+                        "SYS_getpid"
+                    } else {
+                        "SYS_read"
+                    };
+                    return Err(format!(
+                        "replay error at event {}: SignalDelivery interposed inside substituted {} pair (entry event {}) is outside M6 deterministic scope",
+                        event_id, name, enter_id
+                    ));
+                }
+            }
+            TraceEvent::SyscallExit { .. } => {
+                pending_subst_enter = None;
             }
             _ => {}
         }
