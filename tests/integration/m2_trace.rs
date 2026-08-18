@@ -69,7 +69,6 @@ fn test_codec_syscall_exit_signed_result_round_trip() {
     let mut buf = Vec::new();
     let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
 
-    // Write enter first to satisfy pairing validation
     writer.write_syscall_enter(123, 21, [0; 6]).unwrap();
     writer.write_syscall_exit(123, 21, -2).unwrap();
     writer.finish().unwrap();
@@ -190,7 +189,7 @@ fn test_codec_rejection_missing_footer() {
     let mut buf = Vec::new();
     let mut writer = causal::trace::TraceWriter::new_v1(&mut buf).unwrap();
     writer.write_syscall_enter(10, 1, [0; 6]).unwrap();
-    // Do not call finish(), so no footer is written
+
     let err = parse_trace_bytes(&buf).unwrap_err();
     assert!(err.contains("completion footer missing"), "{}", err);
 }
@@ -228,8 +227,6 @@ fn test_codec_rejection_non_monotonic_event_id() {
     writer.write_syscall_exit(10, 1, 0).unwrap();
     writer.finish().unwrap();
 
-    // Event 2 starts at offset 16 + 76 = 92. Event ID is at offset 92 + 4 + 4 = 100.
-    // Overwrite event 2's ID with 1 (duplicate)
     buf[100..108].copy_from_slice(&1_u64.to_le_bytes());
     let err = parse_trace_bytes(&buf).unwrap_err();
     assert!(err.contains("non-monotonic event id"), "{}", err);
@@ -253,7 +250,6 @@ fn test_codec_rejection_malformed_record_length() {
     writer.write_syscall_enter(10, 231, [0; 6]).unwrap();
     writer.finish().unwrap();
 
-    // Overwrite record length at offset 16 with 9999
     buf[16..20].copy_from_slice(&9999_u32.to_le_bytes());
     let err = parse_trace_bytes(&buf).unwrap_err();
     assert!(err.contains("extends past event data region"), "{}", err);
@@ -267,7 +263,6 @@ fn test_cli_record_and_dump_write_hello_round_trip() {
     let trace_file = std::env::temp_dir().join("test_write_hello.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // 1. Record with -o
     let record_out = Command::new(causal_binary())
         .arg("record")
         .arg("-o")
@@ -279,7 +274,6 @@ fn test_cli_record_and_dump_write_hello_round_trip() {
     assert_eq!(record_out.status.code(), Some(0));
     assert!(trace_file.exists(), "trace file must exist after record -o");
 
-    // 2. Dump
     let dump_out = Command::new(causal_binary())
         .arg("dump")
         .arg(&trace_file)
@@ -289,7 +283,6 @@ fn test_cli_record_and_dump_write_hello_round_trip() {
     assert_eq!(dump_out.status.code(), Some(0));
     let dump_str = String::from_utf8_lossy(&dump_out.stdout);
 
-    // Verify deliberate write in dump
     assert!(
         dump_str.contains("syscall-enter") && dump_str.contains("nr=1 args=[1, "),
         "dump must contain SYS_write entry with fd=1: {}",
@@ -341,7 +334,6 @@ fn test_cli_record_output_long_flag() {
 
 #[test]
 fn test_cli_invalid_invocations() {
-    // 1. record -o without argument
     let out1 = Command::new(causal_binary())
         .arg("record")
         .arg("-o")
@@ -350,7 +342,6 @@ fn test_cli_invalid_invocations() {
     assert_eq!(out1.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out1.stderr).contains("Usage:"));
 
-    // 2. record -o trace without target
     let out2 = Command::new(causal_binary())
         .arg("record")
         .arg("-o")
@@ -360,12 +351,10 @@ fn test_cli_invalid_invocations() {
     assert_eq!(out2.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out2.stderr).contains("Usage:"));
 
-    // 3. dump without trace
     let out3 = Command::new(causal_binary()).arg("dump").output().unwrap();
     assert_eq!(out3.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out3.stderr).contains("Usage:"));
 
-    // 4. dump with extra arguments
     let out4 = Command::new(causal_binary())
         .arg("dump")
         .arg("trace.causal")
@@ -380,7 +369,6 @@ fn test_cli_invalid_invocations() {
 fn test_cli_dump_corrupted_files() {
     let tmp_dir = std::env::temp_dir();
 
-    // 1. Bad magic
     let bad_magic_file = tmp_dir.join("corrupt_bad_magic.causal");
     let mut data = vec![0_u8; 32];
     data[0..8].copy_from_slice(b"NOTMAGIC");
@@ -395,7 +383,6 @@ fn test_cli_dump_corrupted_files() {
     assert!(String::from_utf8_lossy(&out1.stderr).contains("invalid trace header magic"));
     let _ = fs::remove_file(&bad_magic_file);
 
-    // 2. Truncated file
     let trunc_file = tmp_dir.join("corrupt_trunc.causal");
     fs::write(&trunc_file, [0_u8; 10]).unwrap();
 

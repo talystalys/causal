@@ -41,10 +41,8 @@ fn test_m4_deleted_source_and_short_read_replay() {
     let _ = fs::remove_file(&test_input);
     let _ = fs::remove_file(&trace_file);
 
-    // 1. Create source file containing expected payload
     fs::write(&test_input, b"CAUSAL_M4_PAYLOAD_21B").unwrap();
 
-    // 2. Record fixture execution
     let rec_out = Command::new(causal_binary())
         .arg("record")
         .arg("-o")
@@ -55,7 +53,6 @@ fn test_m4_deleted_source_and_short_read_replay() {
         .expect("record failed");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // 3. Inspect trace: verify V2+, SYS_read result=21, and KernelMemoryWrite payload
     let parsed = read_trace_file_versioned(&trace_file).expect("trace parse failed");
     assert!(parsed.version >= TRACE_VERSION_2);
 
@@ -82,10 +79,8 @@ fn test_m4_deleted_source_and_short_read_replay() {
         "trace must contain KernelMemoryWrite with recorded bytes"
     );
 
-    // 4. Delete the source file
     fs::remove_file(&test_input).unwrap();
 
-    // 5. Run fixture natively (negative control): O_CREAT makes an empty file, read returns 0, fixture exits 42
     let native_out = Command::new(&fixture)
         .arg(&test_input)
         .output()
@@ -96,7 +91,6 @@ fn test_m4_deleted_source_and_short_read_replay() {
         "native fixture must exit 42 when source file was deleted"
     );
 
-    // 6. Replay under CAUSAL: live read is suppressed, recorded bytes are injected, exits 0
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -156,14 +150,11 @@ fn test_m4_modified_source_replay() {
         .expect("record failed");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // Overwrite input file with completely different content
     fs::write(&test_input, b"CORRUPTED_WRONG_DATA_BYTES_HERE").unwrap();
 
-    // Native run fails (reads wrong bytes)
     let native_out = Command::new(&fixture).arg(&test_input).output().unwrap();
     assert_eq!(native_out.status.code(), Some(42));
 
-    // Replay succeeds (suppresses live read, injects original recorded bytes)
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -196,7 +187,6 @@ fn test_m4_mixed_getpid_and_read_replay() {
 
     fs::write(&test_input, b"CAUSAL_M4_PAYLOAD_21B").unwrap();
 
-    // 1. Record without CAUSAL_EXPECT_GETPID
     let rec_out = Command::new(causal_binary())
         .env_remove("CAUSAL_EXPECT_GETPID")
         .arg("record")
@@ -227,10 +217,8 @@ fn test_m4_mixed_getpid_and_read_replay() {
         "must find SYS_read result 21 in trace"
     );
 
-    // 2. Delete source file
     fs::remove_file(&test_input).unwrap();
 
-    // 3. Native run fails with exit 42
     let native_out = Command::new(&fixture)
         .env("CAUSAL_EXPECT_GETPID", recorded_pid.to_string())
         .arg(&test_input)
@@ -238,7 +226,6 @@ fn test_m4_mixed_getpid_and_read_replay() {
         .unwrap();
     assert_eq!(native_out.status.code(), Some(42));
 
-    // 4. Replay under CAUSAL: both getpid AND read are substituted in one stream
     let replay_out = Command::new(causal_binary())
         .env("CAUSAL_EXPECT_GETPID", recorded_pid.to_string())
         .arg("replay")
@@ -256,7 +243,6 @@ fn test_m4_mixed_getpid_and_read_replay() {
         stderr
     );
 
-    // Verify both diagnostics are emitted
     assert!(
         stderr.contains("replay-substitute") && stderr.contains("syscall=getpid"),
         "stderr must contain getpid substitution diagnostic: {}",
@@ -278,14 +264,11 @@ fn test_m4_remote_memory_transfer_failure_exactness() {
     let repo_root = get_repo_root();
     let fixture = repo_root.join("tests/bin/exit_42");
 
-    // Launch a controlled tracee under ptrace
     let pid = launch_traced_child(fixture.to_str().unwrap(), &[]).unwrap();
 
-    // Wait for bootstrap stop
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
 
-    // 1. Test read_process_memory_exact with invalid address 0x0 -> must return Err
     let read_err = read_process_memory_exact(pid, 0x0, 64).unwrap_err();
     assert!(
         read_err.contains("process_vm_readv failed"),
@@ -293,7 +276,6 @@ fn test_m4_remote_memory_transfer_failure_exactness() {
         read_err
     );
 
-    // 2. Test write_process_memory_exact with invalid address 0x0 -> must return Err
     let write_err = write_process_memory_exact(pid, 0x0, b"test_payload").unwrap_err();
     assert!(
         write_err.contains("process_vm_writev failed"),
@@ -301,7 +283,6 @@ fn test_m4_remote_memory_transfer_failure_exactness() {
         write_err
     );
 
-    // Clean up child process
     kill_and_reap(pid);
 }
 
@@ -317,7 +298,6 @@ fn test_m4_eof_replay() {
     let _ = fs::remove_file(&test_input);
     let _ = fs::remove_file(&trace_file);
 
-    // Create empty file
     fs::write(&test_input, b"").unwrap();
 
     let rec_out = Command::new(causal_binary())
@@ -330,7 +310,6 @@ fn test_m4_eof_replay() {
         .expect("record failed");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // Trace must have read exit=0 and NO memory write event attached
     let parsed = read_trace_file_versioned(&trace_file).unwrap();
     let mut found_eof_exit = false;
     for event in &parsed.events {
@@ -342,14 +321,11 @@ fn test_m4_eof_replay() {
     }
     assert!(found_eof_exit);
 
-    // Modify file to contain data
     fs::write(&test_input, b"NOW_CONTAINS_DATA").unwrap();
 
-    // Native run fails (reads data, not EOF)
     let native_out = Command::new(&fixture).arg(&test_input).output().unwrap();
     assert_eq!(native_out.status.code(), Some(42));
 
-    // Replay succeeds (suppresses live read, injects 0, buffer untouched)
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -447,7 +423,6 @@ fn test_m4_failed_read_replay() {
 
 #[test]
 fn test_m4_v1_compatibility_and_rejection() {
-    // 1. Synthetic V1 trace with SYS_getpid can still be parsed
     let mut v1_buf = Vec::new();
     let mut writer = TraceWriter::new_v1(&mut v1_buf).unwrap();
     assert_eq!(writer.version(), TRACE_VERSION_1);
@@ -459,7 +434,6 @@ fn test_m4_v1_compatibility_and_rejection() {
     assert_eq!(parsed.version, TRACE_VERSION_1);
     assert_eq!(parsed.events.len(), 2);
 
-    // 2. V1 trace with positive SYS_read cannot be memory-replayed
     let mut v1_read_buf = Vec::new();
     let mut writer2 = TraceWriter::new_v1(&mut v1_read_buf).unwrap();
     writer2
@@ -524,27 +498,24 @@ fn test_m4_deterministic_v2_serialization() {
 
 #[test]
 fn test_m4_v2_corruption_cases() {
-    // 1. KernelMemoryWrite in V1 file -> rejected
     let mut v1_buf = Vec::new();
     let mut w = TraceWriter::new_v1(&mut v1_buf).unwrap();
     w.write_syscall_enter(1, 0, [0; 6]).unwrap();
     w.write_syscall_exit(1, 0, 5).unwrap();
     w.finish().unwrap();
     let mut forged_v1 = v1_buf.clone();
-    forged_v1[20] = 3; // kind=3
+    forged_v1[20] = 3;
     assert!(parse_trace_bytes(&forged_v1).is_err());
 
-    // 2. Unknown V2 event kind -> rejected
     let mut v2_unknown = Vec::new();
     let mut w = TraceWriter::new_v2(&mut v2_unknown).unwrap();
     w.write_syscall_enter(1, 39, [0; 6]).unwrap();
     w.write_syscall_exit(1, 39, 10).unwrap();
     w.finish().unwrap();
-    v2_unknown[20] = 99; // unknown kind
+    v2_unknown[20] = 99;
     let err = parse_trace_bytes(&v2_unknown).unwrap_err();
     assert!(err.contains("unknown event kind 99"), "{}", err);
 
-    // 3. Positive SYS_read missing required KernelMemoryWrite in V2 -> rejected
     let mut missing_mem = Vec::new();
     let mut w = TraceWriter::new_v2(&mut missing_mem).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
@@ -558,7 +529,6 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 4. KernelMemoryWrite with mismatched source_event_id -> rejected
     let mut wrong_source = Vec::new();
     let mut w = TraceWriter::new_v2(&mut wrong_source).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
@@ -574,7 +544,6 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 5. C1: KernelMemoryWrite source_event_id references a SyscallEnter (not a SyscallExit) -> rejected
     let mut source_is_enter = Vec::new();
     let mut w = TraceWriter::new_v2(&mut source_is_enter).unwrap();
     let enter_id = w
@@ -590,7 +559,6 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 6. C2: KernelMemoryWrite attached to SyscallExit whose syscall is NOT SYS_read -> rejected
     let mut source_not_read = Vec::new();
     let mut w = TraceWriter::new_v2(&mut source_not_read).unwrap();
     w.write_syscall_enter(1, 1, [1, 0x7ffd_1000, 4, 0, 0, 0])
@@ -606,7 +574,6 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 7. C3 / Z: KernelMemoryWrite attached to SYS_read whose result is 0 -> rejected
     let mut mem_after_zero_read = Vec::new();
     let mut w = TraceWriter::new_v2(&mut mem_after_zero_read).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
@@ -622,7 +589,6 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 8. C4 / Z: KernelMemoryWrite attached to SYS_read whose result is negative -> rejected
     let mut mem_after_failed_read = Vec::new();
     let mut w = TraceWriter::new_v2(&mut mem_after_failed_read).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
@@ -638,26 +604,24 @@ fn test_m4_v2_corruption_cases() {
         err
     );
 
-    // 9. KernelMemoryWrite data length != read result -> rejected
     let mut mismatched_len = Vec::new();
     let mut w = TraceWriter::new_v2(&mut mismatched_len).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
         .unwrap();
     let exit_id = w.write_syscall_exit(1, 0, 10).unwrap();
     w.write_kernel_memory_write(1, exit_id, 0x7ffd_1000, b"short")
-        .unwrap(); // len 5 != 10
+        .unwrap();
     w.finish().unwrap();
     let err = parse_trace_bytes(&mismatched_len).unwrap_err();
     assert!(err.contains("does not match read result"), "{}", err);
 
-    // 10. KernelMemoryWrite recorded address != enter buffer address -> rejected
     let mut wrong_addr = Vec::new();
     let mut w = TraceWriter::new_v2(&mut wrong_addr).unwrap();
     w.write_syscall_enter(1, 0, [4, 0x7ffd_1000, 64, 0, 0, 0])
         .unwrap();
     let exit_id = w.write_syscall_exit(1, 0, 4).unwrap();
     w.write_kernel_memory_write(1, exit_id, 0x7ffd_9999, b"test")
-        .unwrap(); // addr differs
+        .unwrap();
     w.finish().unwrap();
     let err = parse_trace_bytes(&wrong_addr).unwrap_err();
     assert!(
@@ -679,7 +643,6 @@ fn test_m4_100_replays_stress() {
     let _ = fs::remove_file(&test_input);
     let _ = fs::remove_file(&trace_file);
 
-    // Record ONCE with expected content
     fs::write(&test_input, b"CAUSAL_M4_PAYLOAD_21B").unwrap();
     let rec_out = Command::new(causal_binary())
         .arg("record")
@@ -691,10 +654,8 @@ fn test_m4_100_replays_stress() {
         .expect("record failed for stress");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // Overwrite the input file with DIFFERENT corrupt bytes to ensure external independence
     fs::write(&test_input, b"WRONG_DATA_EVERY_SINGLE_REPLAY_ITERATION").unwrap();
 
-    // Replay 100 times against the single recorded trace
     for i in 1..=100 {
         let replay_out = Command::new(causal_binary())
             .arg("replay")

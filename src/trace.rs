@@ -4,79 +4,54 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-/// Fixed 8-byte trace header magic: "CAUSAL\0\0"
 pub const TRACE_HEADER_MAGIC: &[u8; 8] = b"CAUSAL\0\0";
 
-/// Fixed 8-byte trace footer magic: "CAUSEND\0"
 pub const TRACE_FOOTER_MAGIC: &[u8; 8] = b"CAUSEND\0";
 
-/// Trace format version 1.
 pub const TRACE_VERSION_1: u32 = 1;
 
-/// Trace format version 2 (with KernelMemoryWrite support).
 pub const TRACE_VERSION_2: u32 = 2;
 
-/// Trace format version 3 (with virtual memory map model support).
 pub const TRACE_VERSION_3: u32 = 3;
 
-/// Trace format version 4 (with signal delivery and siginfo support).
 pub const TRACE_VERSION_4: u32 = 4;
 
-/// Architecture ID for Linux x86-64.
 pub const ARCH_X86_64: u16 = 1;
 
-/// Byte order ID for little-endian.
 pub const BYTE_ORDER_LITTLE_ENDIAN: u8 = 1;
 
-/// Pointer width in bytes for 64-bit architecture.
 pub const POINTER_WIDTH_64: u8 = 8;
 
-/// Event kind identifier for SyscallEnter.
 pub const EVENT_KIND_SYSCALL_ENTER: u8 = 1;
 
-/// Event kind identifier for SyscallExit.
 pub const EVENT_KIND_SYSCALL_EXIT: u8 = 2;
 
-/// Event kind identifier for KernelMemoryWrite (V2).
 pub const EVENT_KIND_KERNEL_MEMORY_WRITE: u8 = 3;
 
-/// Event kind identifier for MemoryMapSnapshot (V3).
 pub const EVENT_KIND_MEMORY_MAP_SNAPSHOT: u8 = 4;
 
-/// Event kind identifier for MemoryMapAdd (V3).
 pub const EVENT_KIND_MEMORY_MAP_ADD: u8 = 5;
 
-/// Event kind identifier for MemoryMapRemove (V3).
 pub const EVENT_KIND_MEMORY_MAP_REMOVE: u8 = 6;
 
-/// Event kind identifier for SignalDelivery (V4).
 pub const EVENT_KIND_SIGNAL_DELIVERY: u8 = 7;
 
-/// Fixed record length for SyscallEnter (excluding 4-byte length prefix).
 pub const RECORD_LEN_SYSCALL_ENTER: u32 = 72;
 
-/// Fixed record length for SyscallExit (excluding 4-byte length prefix).
 pub const RECORD_LEN_SYSCALL_EXIT: u32 = 32;
 
-/// Fixed header length in body for KernelMemoryWrite (excluding 4-byte length prefix and variable data).
 pub const RECORD_LEN_KERNEL_MEMORY_WRITE_HEADER: u32 = 40;
 
-/// Fixed descriptor length for MemoryRegion header (excluding variable label).
 pub const DESCRIPTOR_LEN_REGION_HEADER: usize = 48;
 
-/// Fixed header length in body for SignalDelivery (excluding 4-byte length prefix and siginfo bytes).
 pub const RECORD_LEN_SIGNAL_DELIVERY_HEADER: u32 = 32;
 
-/// Standard x86-64 Linux siginfo_t size in bytes.
 pub const SIGINFO_SIZE_X86_64: usize = 128;
 
-/// Total size of trace header in bytes.
 pub const HEADER_SIZE: usize = 16;
 
-/// Total size of trace footer in bytes.
 pub const FOOTER_SIZE: usize = 16;
 
-/// Known Linux x86-64 syscall numbers.
 pub const SYS_READ_X86_64: u64 = 0;
 pub const SYS_WRITE_X86_64: u64 = 1;
 pub const SYS_MMAP_X86_64: u64 = 9;
@@ -85,12 +60,10 @@ pub const SYS_MUNMAP_X86_64: u64 = 11;
 pub const SYS_BRK_X86_64: u64 = 12;
 pub const SYS_GETPID_X86_64: u64 = 39;
 
-/// Returns true if the syscall is substituted deterministically by CAUSAL (M6: SYS_read, SYS_getpid).
 pub fn is_substituted_syscall(number: u64) -> bool {
     number == SYS_READ_X86_64 || number == SYS_GETPID_X86_64
 }
 
-/// Returns human-readable name for substituted syscalls.
 pub fn substituted_syscall_name(number: u64) -> &'static str {
     match number {
         SYS_READ_X86_64 => "SYS_read",
@@ -101,7 +74,6 @@ pub fn substituted_syscall_name(number: u64) -> &'static str {
 pub const SYS_EXIT_X86_64: u64 = 60;
 pub const SYS_EXIT_GROUP_X86_64: u64 = 231;
 
-/// In-memory representation of a parsed trace event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceEvent {
     SyscallEnter {
@@ -188,7 +160,6 @@ impl TraceEvent {
     }
 }
 
-/// Parsed trace file containing format version and event sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTrace {
     pub version: u32,
@@ -203,7 +174,6 @@ impl std::ops::Deref for ParsedTrace {
     }
 }
 
-/// Helper function to encode a single MemoryRegion descriptor to bytes.
 pub fn encode_region_descriptor(region: &MemoryRegion, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&region.start.to_le_bytes());
     buf.extend_from_slice(&region.end.to_le_bytes());
@@ -213,13 +183,12 @@ pub fn encode_region_descriptor(region: &MemoryRegion, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&region.dev_minor.to_le_bytes());
     buf.push(region.prot_bits());
     buf.push(region.sharing_byte());
-    buf.extend_from_slice(&[0_u8; 2]); // reserved = 0
+    buf.extend_from_slice(&[0_u8; 2]);
     let label_len = region.label.len() as u32;
     buf.extend_from_slice(&label_len.to_le_bytes());
     buf.extend_from_slice(&region.label);
 }
 
-/// Helper function to decode a single MemoryRegion descriptor from bytes.
 pub fn decode_region_descriptor(bytes: &[u8], offset: &mut usize) -> Result<MemoryRegion, String> {
     if *offset + DESCRIPTOR_LEN_REGION_HEADER > bytes.len() {
         return Err("truncated region descriptor header".to_string());
@@ -273,7 +242,6 @@ pub fn decode_region_descriptor(bytes: &[u8], offset: &mut usize) -> Result<Memo
     Ok(region)
 }
 
-/// Streaming trace writer that encodes V1, V2, V3, or V4 binary format directly to an `io::Write` sink.
 pub struct TraceWriter<W: Write> {
     writer: W,
     version: u32,
@@ -283,32 +251,26 @@ pub struct TraceWriter<W: Write> {
 }
 
 impl<W: Write> TraceWriter<W> {
-    /// Creates a new `TraceWriter` defaulting to Trace Format V4 for production recording.
     pub fn new(writer: W) -> Result<Self, io::Error> {
         Self::new_v4(writer)
     }
 
-    /// Creates a `TraceWriter` explicitly with Version 1 format.
     pub fn new_v1(writer: W) -> Result<Self, io::Error> {
         Self::new_with_version(writer, TRACE_VERSION_1)
     }
 
-    /// Creates a `TraceWriter` explicitly with Version 2 format.
     pub fn new_v2(writer: W) -> Result<Self, io::Error> {
         Self::new_with_version(writer, TRACE_VERSION_2)
     }
 
-    /// Creates a `TraceWriter` explicitly with Version 3 format.
     pub fn new_v3(writer: W) -> Result<Self, io::Error> {
         Self::new_with_version(writer, TRACE_VERSION_3)
     }
 
-    /// Creates a `TraceWriter` explicitly with Version 4 format.
     pub fn new_v4(writer: W) -> Result<Self, io::Error> {
         Self::new_with_version(writer, TRACE_VERSION_4)
     }
 
-    /// Creates a `TraceWriter` with the specified format version and writes the 16-byte header immediately.
     pub fn new_with_version(mut writer: W, version: u32) -> Result<Self, io::Error> {
         if version != TRACE_VERSION_1
             && version != TRACE_VERSION_2
@@ -343,7 +305,6 @@ impl<W: Write> TraceWriter<W> {
         self.version
     }
 
-    /// Encodes and writes a `SyscallEnter` event record.
     pub fn write_syscall_enter(
         &mut self,
         tid: u32,
@@ -359,15 +320,14 @@ impl<W: Write> TraceWriter<W> {
         let event_id = self.next_event_id;
         let mut buf = [0_u8; (4 + RECORD_LEN_SYSCALL_ENTER) as usize];
 
-        // 4-byte record length prefix
         buf[0..4].copy_from_slice(&RECORD_LEN_SYSCALL_ENTER.to_le_bytes());
-        // Event header (kind + 3 reserved bytes)
+
         buf[4] = EVENT_KIND_SYSCALL_ENTER;
         buf[5..8].copy_from_slice(&[0_u8; 3]);
-        // Event metadata
+
         buf[8..16].copy_from_slice(&event_id.to_le_bytes());
         buf[16..20].copy_from_slice(&tid.to_le_bytes());
-        // Payload: syscall number + 6 args
+
         buf[20..28].copy_from_slice(&number.to_le_bytes());
         for (i, arg) in args.iter().enumerate() {
             let start = 28 + i * 8;
@@ -380,7 +340,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `SyscallExit` event record.
     pub fn write_syscall_exit(
         &mut self,
         tid: u32,
@@ -396,15 +355,14 @@ impl<W: Write> TraceWriter<W> {
         let event_id = self.next_event_id;
         let mut buf = [0_u8; (4 + RECORD_LEN_SYSCALL_EXIT) as usize];
 
-        // 4-byte record length prefix
         buf[0..4].copy_from_slice(&RECORD_LEN_SYSCALL_EXIT.to_le_bytes());
-        // Event header (kind + 3 reserved bytes)
+
         buf[4] = EVENT_KIND_SYSCALL_EXIT;
         buf[5..8].copy_from_slice(&[0_u8; 3]);
-        // Event metadata
+
         buf[8..16].copy_from_slice(&event_id.to_le_bytes());
         buf[16..20].copy_from_slice(&tid.to_le_bytes());
-        // Payload: syscall number + result
+
         buf[20..28].copy_from_slice(&number.to_le_bytes());
         buf[28..36].copy_from_slice(&result.to_le_bytes());
 
@@ -414,7 +372,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `KernelMemoryWrite` event record (V2+).
     pub fn write_kernel_memory_write(
         &mut self,
         tid: u32,
@@ -447,19 +404,18 @@ impl<W: Write> TraceWriter<W> {
         let event_id = self.next_event_id;
         let mut header_buf = [0_u8; 4 + RECORD_LEN_KERNEL_MEMORY_WRITE_HEADER as usize];
 
-        // 4-byte record length prefix
         header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
-        // Event header (kind=3 + 3 reserved bytes)
+
         header_buf[4] = EVENT_KIND_KERNEL_MEMORY_WRITE;
         header_buf[5..8].copy_from_slice(&[0_u8; 3]);
-        // Event metadata
+
         header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
         header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
-        // Memory payload header
+
         header_buf[20..28].copy_from_slice(&source_event_id.to_le_bytes());
         header_buf[28..36].copy_from_slice(&recorded_address.to_le_bytes());
         header_buf[36..40].copy_from_slice(&data_len.to_le_bytes());
-        header_buf[40..44].copy_from_slice(&0_u32.to_le_bytes()); // payload_reserved = 0
+        header_buf[40..44].copy_from_slice(&0_u32.to_le_bytes());
 
         self.writer.write_all(&header_buf)?;
         self.writer.write_all(data)?;
@@ -469,7 +425,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `MemoryMapSnapshot` event record (V3+).
     pub fn write_memory_map_snapshot(
         &mut self,
         tid: u32,
@@ -498,19 +453,18 @@ impl<W: Write> TraceWriter<W> {
             .ok_or_else(|| io::Error::other("record length overflow in MemoryMapSnapshot"))?;
 
         let event_id = self.next_event_id;
-        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+        let mut header_buf = [0_u8; 28];
 
-        // 4-byte record length prefix
         header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
-        // Event header (kind=4 + 3 reserved bytes)
+
         header_buf[4] = EVENT_KIND_MEMORY_MAP_SNAPSHOT;
         header_buf[5..8].copy_from_slice(&[0_u8; 3]);
-        // Event metadata
+
         header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
         header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
-        // Snapshot header
+
         header_buf[20..24].copy_from_slice(&region_count.to_le_bytes());
-        header_buf[24..28].copy_from_slice(&0_u32.to_le_bytes()); // reserved = 0
+        header_buf[24..28].copy_from_slice(&0_u32.to_le_bytes());
 
         self.writer.write_all(&header_buf)?;
         self.writer.write_all(&descriptors_buf)?;
@@ -520,7 +474,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `MemoryMapAdd` event record (V3+).
     pub fn write_memory_map_add(
         &mut self,
         tid: u32,
@@ -546,7 +499,7 @@ impl<W: Write> TraceWriter<W> {
             .ok_or_else(|| io::Error::other("record length overflow in MemoryMapAdd"))?;
 
         let event_id = self.next_event_id;
-        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+        let mut header_buf = [0_u8; 28];
 
         header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
         header_buf[4] = EVENT_KIND_MEMORY_MAP_ADD;
@@ -563,7 +516,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `MemoryMapRemove` event record (V3+).
     pub fn write_memory_map_remove(
         &mut self,
         tid: u32,
@@ -589,7 +541,7 @@ impl<W: Write> TraceWriter<W> {
             .ok_or_else(|| io::Error::other("record length overflow in MemoryMapRemove"))?;
 
         let event_id = self.next_event_id;
-        let mut header_buf = [0_u8; 28]; // 4-byte len + 24-byte header
+        let mut header_buf = [0_u8; 28];
 
         header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
         header_buf[4] = EVENT_KIND_MEMORY_MAP_REMOVE;
@@ -606,7 +558,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Encodes and writes a `SignalDelivery` event record (V4+).
     pub fn write_signal_delivery(
         &mut self,
         tid: u32,
@@ -641,15 +592,14 @@ impl<W: Write> TraceWriter<W> {
         let event_id = self.next_event_id;
         let mut header_buf = [0_u8; 4 + RECORD_LEN_SIGNAL_DELIVERY_HEADER as usize];
 
-        // 4-byte record length prefix
         header_buf[0..4].copy_from_slice(&record_len.to_le_bytes());
-        // Event header (kind=7 + 3 reserved bytes)
+
         header_buf[4] = EVENT_KIND_SIGNAL_DELIVERY;
         header_buf[5..8].copy_from_slice(&[0_u8; 3]);
-        // Event metadata
+
         header_buf[8..16].copy_from_slice(&event_id.to_le_bytes());
         header_buf[16..20].copy_from_slice(&tid.to_le_bytes());
-        // Signal payload header
+
         header_buf[20..24].copy_from_slice(&signal_number.to_le_bytes());
         header_buf[24..28].copy_from_slice(&si_errno.to_le_bytes());
         header_buf[28..32].copy_from_slice(&si_code.to_le_bytes());
@@ -663,7 +613,6 @@ impl<W: Write> TraceWriter<W> {
         Ok(event_id)
     }
 
-    /// Writes the 16-byte completion footer and flushes the underlying writer.
     pub fn finish(&mut self) -> Result<(), io::Error> {
         if self.finished {
             return Ok(());
@@ -680,7 +629,6 @@ impl<W: Write> TraceWriter<W> {
     }
 }
 
-/// Parses raw trace bytes into a validated `ParsedTrace` object.
 pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
     if bytes.len() < HEADER_SIZE + FOOTER_SIZE {
         return Err(format!(
@@ -690,7 +638,6 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
         ));
     }
 
-    // 1. Validate Header
     let magic = &bytes[0..8];
     if magic != TRACE_HEADER_MAGIC {
         return Err(format!(
@@ -734,7 +681,6 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
         return Err(format!("unsupported pointer width {}", pointer_width));
     }
 
-    // 2. Validate Footer location and content
     let footer_start = bytes.len() - FOOTER_SIZE;
     let expected_event_count = u64::from_le_bytes(
         bytes[footer_start..footer_start + 8]
@@ -749,7 +695,6 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
         ));
     }
 
-    // 3. Parse Framed Event Records
     let mut offset = HEADER_SIZE;
     let mut events = Vec::new();
     let mut expected_event_id: u64 = 1;
@@ -963,7 +908,6 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
                     ));
                 }
 
-                // Verify regions form a valid canonical snapshot (must already be sorted and non-overlapping)
                 validate_regions_canonical_order(&regions)?;
 
                 events.push(TraceEvent::MemoryMapSnapshot {
@@ -1095,7 +1039,6 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
 
                 let siginfo_bytes = record_body[32..32 + siginfo_len].to_vec();
 
-                // Validate raw siginfo common fields match explicit header fields
                 let raw_signo = i32::from_le_bytes(
                     siginfo_bytes[0..4]
                         .try_into()
@@ -1160,24 +1103,21 @@ pub fn parse_trace_bytes(bytes: &[u8]) -> Result<ParsedTrace, String> {
         ));
     }
 
-    // 4. Validate Structural Syscall Pairing, Memory Events, and V3 Memory Map Invariants
     validate_trace_structure(version, &events)?;
 
     Ok(ParsedTrace { version, events })
 }
 
-/// Validates structural pairing, memory-event invariants, and V3 memory-map model invariants.
 fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), String> {
     let mut pending: HashMap<u32, (u64, [u64; 6], u64)> = HashMap::new();
-    // Tracks positive SYS_read exit awaiting its required KernelMemoryWrite: (tid, number, result, exit_event_id, enter_buf_addr)
+
     let mut pending_read_exit: Option<(u32, u64, i64, u64, u64)> = None;
 
-    // V3 map validation state
     let mut snapshot_seen = false;
     let mut current_map_model: Option<MemoryMapModel> = None;
-    // Map of exit_event_id -> syscall_number
+
     let mut exit_syscall_map: HashMap<u64, u64> = HashMap::new();
-    // Tracks current delta source grouping: Option<(source_event_id, seen_add)>
+
     let mut current_delta_group: Option<(u64, bool)> = None;
     let mut last_syscall_exit_id: Option<u64> = None;
 
@@ -1412,7 +1352,6 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                     ));
                 }
 
-                // Check delta group ordering (removes must precede adds for same source)
                 match current_delta_group {
                     Some((group_source, seen_add)) => {
                         if group_source != *source_event_id {
@@ -1466,7 +1405,6 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
                     ));
                 }
 
-                // Update delta group
                 current_delta_group = Some((*source_event_id, true));
 
                 if let Some(model) = current_map_model.as_mut() {
@@ -1525,7 +1463,6 @@ fn validate_trace_structure(version: u32, events: &[TraceEvent]) -> Result<(), S
     Ok(())
 }
 
-/// Reconstructs the historical virtual memory map model immediately after the specified `target_event_id`.
 pub fn reconstruct_maps_at_event(
     parsed_trace: &ParsedTrace,
     target_event_id: u64,
@@ -1602,7 +1539,6 @@ pub fn reconstruct_maps_at_event(
     model.ok_or_else(|| "trace is missing initial MemoryMapSnapshot event".to_string())
 }
 
-/// Reads a trace file from disk and parses its binary format into a validated `ParsedTrace` object.
 pub fn read_trace_file_versioned<P: AsRef<Path>>(path: P) -> Result<ParsedTrace, String> {
     let path_ref = path.as_ref();
     let mut file = File::open(path_ref)
@@ -1615,12 +1551,10 @@ pub fn read_trace_file_versioned<P: AsRef<Path>>(path: P) -> Result<ParsedTrace,
     parse_trace_bytes(&bytes)
 }
 
-/// Reads a trace file from disk and returns its validated event list (compatible with V1, V2, V3, and V4).
 pub fn read_trace_file<P: AsRef<Path>>(path: P) -> Result<Vec<TraceEvent>, String> {
     Ok(read_trace_file_versioned(path)?.events)
 }
 
-/// Parses a trace file from disk and prints its human-readable dump to stdout.
 pub fn dump_trace<P: AsRef<Path>>(path: P) -> Result<(), String> {
     let parsed = read_trace_file_versioned(path)?;
 

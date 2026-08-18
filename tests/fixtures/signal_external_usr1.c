@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    // Write our PID to the readiness file
+    
     FILE *f = fopen(argv[1], "w");
     if (!f) {
         perror("fopen ready-file");
@@ -47,12 +47,12 @@ int main(int argc, char **argv) {
     fflush(f);
     fclose(f);
 
-    // Busy loop without syscalls until signal arrives
+    
     while (!g_received) {
-        // Pure userspace spin
+        
     }
 
-    // Validate received signal metadata
+    
     if (g_sig != SIGUSR1) {
         fprintf(stderr, "signal mismatch: expected %d, got %d\n", SIGUSR1, (int)g_sig);
         return 4;

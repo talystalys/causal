@@ -24,12 +24,12 @@ int main(int argc, char **argv) {
     long nread = syscall(SYS_read, fd, buf, (size_t)BUF_SIZE);
     syscall(SYS_close, fd);
 
-    // Expect EOF (0 bytes read)
+    
     if (nread != 0) {
         return 42;
     }
 
-    // Verify entire buffer remains untouched
+    
     for (size_t i = 0; i < BUF_SIZE; i++) {
         if (buf[i] != SENTINEL) {
             return 42;

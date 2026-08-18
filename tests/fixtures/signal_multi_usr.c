@@ -43,19 +43,19 @@ int main(void) {
         return 2;
     }
 
-    // 1. Deliver SIGUSR1
+    
     raise(SIGUSR1);
     if (!g_usr1_received) {
         return 3;
     }
 
-    // 2. Intervening syscall: getpid
+    
     pid_t pid = getpid();
     if (pid <= 0) {
         return 4;
     }
 
-    // 3. Deliver SIGUSR2
+    
     raise(SIGUSR2);
     if (!g_usr2_received) {
         return 5;

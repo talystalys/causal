@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
         return 3;
     }
 
-    // Write PID to readiness file using direct open/dprintf/close
+    
     int rfd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (rfd < 0) {
         return 4;
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
     dprintf(rfd, "%d\n", (int)getpid());
     close(rfd);
 
-    // Blocking read on empty pipe
+    
     char buf[16];
     long nread = syscall(SYS_read, fds[0], buf, sizeof(buf));
     (void)nread;

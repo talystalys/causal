@@ -10,27 +10,22 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr;
 
-/// Represents the lifecycle state of the child process during launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchState {
-    /// Child has forked and is expected to raise SIGSTOP after PTRACE_TRACEME.
     AwaitingStartupStop,
-    /// Child has been configured with options and resumed; awaiting execve completion.
+
     AwaitingExec,
-    /// Target program has successfully executed and is actively running under syscall tracing.
+
     Running,
 }
 
-/// Final observed termination outcome of the tracee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceeTermination {
-    /// Process exited normally with the given exit code.
     Exited(i32),
-    /// Process was terminated by the given signal number.
+
     Signaled(i32),
 }
 
-/// In-memory representation of an active syscall entry awaiting its exit stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingSyscall {
     pub tid: libc::pid_t,
@@ -38,7 +33,6 @@ pub struct PendingSyscall {
     pub args: [u64; 6],
 }
 
-/// Structured error payload sent across the child->parent launch pipe on pre-exec failure.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct LaunchErrorPayload {
@@ -50,12 +44,10 @@ const STAGE_TRACEME: u32 = 1;
 const STAGE_STARTUP_STOP: u32 = 2;
 const STAGE_EXEC: u32 = 3;
 
-/// Formats an OS errno into a readable message.
 pub fn format_errno(errno: i32) -> String {
     format!("{}", io::Error::from_raw_os_error(errno))
 }
 
-/// Retrieves native x86-64 general-purpose registers via `PTRACE_GETREGS`.
 pub fn get_regs_x86_64(pid: libc::pid_t) -> Result<libc::user_regs_struct, String> {
     let mut regs = MaybeUninit::<libc::user_regs_struct>::uninit();
     let res = unsafe {
@@ -73,7 +65,6 @@ pub fn get_regs_x86_64(pid: libc::pid_t) -> Result<libc::user_regs_struct, Strin
     Ok(unsafe { regs.assume_init() })
 }
 
-/// Sets native x86-64 general-purpose registers via `PTRACE_SETREGS`.
 pub fn set_regs_x86_64(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Result<(), String> {
     let res = unsafe {
         libc::ptrace(
@@ -90,7 +81,6 @@ pub fn set_regs_x86_64(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Resul
     Ok(())
 }
 
-/// Retrieves kernel syscall information at a syscall stop via `PTRACE_GET_SYSCALL_INFO`.
 pub fn get_syscall_info(pid: libc::pid_t) -> Result<libc::ptrace_syscall_info, String> {
     let mut info: MaybeUninit<libc::ptrace_syscall_info> = MaybeUninit::uninit();
     let get_res = unsafe {
@@ -111,7 +101,6 @@ pub fn get_syscall_info(pid: libc::pid_t) -> Result<libc::ptrace_syscall_info, S
     Ok(unsafe { info.assume_init() })
 }
 
-/// Retrieves `siginfo_t` for a tracee stopped in a signal-delivery-stop via `PTRACE_GETSIGINFO`.
 pub fn get_signal_info(pid: libc::pid_t) -> Result<libc::siginfo_t, String> {
     let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
     let res = unsafe {
@@ -129,7 +118,6 @@ pub fn get_signal_info(pid: libc::pid_t) -> Result<libc::siginfo_t, String> {
     Ok(unsafe { info.assume_init() })
 }
 
-/// Sets `siginfo_t` for a tracee stopped in a signal-delivery-stop via `PTRACE_SETSIGINFO`.
 pub fn set_signal_info(pid: libc::pid_t, info: &libc::siginfo_t) -> Result<(), String> {
     let res = unsafe {
         libc::ptrace(
@@ -146,7 +134,6 @@ pub fn set_signal_info(pid: libc::pid_t, info: &libc::siginfo_t) -> Result<(), S
     Ok(())
 }
 
-/// Reliably sends SIGKILL to a traced child and reaps it completely to avoid zombies or stopped processes.
 pub fn kill_and_reap(pid: libc::pid_t) {
     unsafe {
         let _ = libc::kill(pid, libc::SIGKILL);
@@ -167,7 +154,6 @@ pub fn kill_and_reap(pid: libc::pid_t) {
     }
 }
 
-/// Reads an exact number of bytes from the stopped remote process address space using `process_vm_readv`.
 pub fn read_process_memory_exact(
     pid: libc::pid_t,
     remote_addr: u64,
@@ -207,11 +193,7 @@ pub fn read_process_memory_exact(
     Ok(buf)
 }
 
-/// Forks and launches `target` with `args` under ptrace supervision up to the post-exec `PTRACE_SYSCALL` state.
-///
-/// Returns the live tracee PID on success, or a descriptive error on failure.
 pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t, String> {
-    // 1. Prepare target and arguments as CStrings prior to fork.
     let c_target = CString::new(target)
         .map_err(|_| format!("target path contains interior null byte: {:?}", target))?;
 
@@ -229,7 +211,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     }
     c_argv.push(ptr::null());
 
-    // 2. Create error reporting pipe with O_CLOEXEC.
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(format!(
@@ -240,7 +221,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     let pipe_read = pipe_fds[0];
     let pipe_write = pipe_fds[1];
 
-    // 3. Fork child process.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
@@ -252,12 +232,9 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     }
 
     if pid == 0 {
-        // --- CHILD PROCESS ---
-        // Async-signal-safe path: no allocations, no locks, no complex runtime.
         unsafe {
             libc::close(pipe_read);
 
-            // Establish tracing relationship.
             if libc::ptrace(
                 libc::PTRACE_TRACEME,
                 0,
@@ -279,7 +256,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
                 libc::_exit(127);
             }
 
-            // Raise intentional startup SIGSTOP to synchronize with parent tracer.
             if libc::raise(libc::SIGSTOP) != 0 {
                 let errno = *libc::__errno_location();
                 let payload = LaunchErrorPayload {
@@ -295,10 +271,8 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
                 libc::_exit(127);
             }
 
-            // Execute target. On success, O_CLOEXEC closes pipe_write.
             libc::execvp(c_target.as_ptr(), c_argv.as_ptr());
 
-            // If execvp returns, it failed.
             let errno = *libc::__errno_location();
             let payload = LaunchErrorPayload {
                 stage: STAGE_EXEC,
@@ -314,7 +288,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         }
     }
 
-    // --- PARENT TRACER PROCESS ---
     unsafe {
         libc::close(pipe_write);
     }
@@ -322,7 +295,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     let mut state = LaunchState::AwaitingStartupStop;
     let mut status: libc::c_int = 0;
 
-    // Helper closure to read launch error from pipe (if any).
     let read_launch_error = || -> Option<LaunchErrorPayload> {
         let mut payload = LaunchErrorPayload { stage: 0, errno: 0 };
         let mut total_read = 0;
@@ -340,7 +312,7 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
             if n > 0 {
                 total_read += n as usize;
             } else if n == 0 {
-                break; // EOF
+                break;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -357,7 +329,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         }
     };
 
-    // 4. Wait for deliberate startup SIGSTOP.
     let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
     if wait_res < 0 {
         let err = io::Error::last_os_error();
@@ -369,7 +340,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     }
 
     if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGSTOP {
-        // Child did not enter expected startup stop. Check launch pipe for error.
         let launch_err = read_launch_error();
         unsafe { libc::close(pipe_read) };
 
@@ -416,7 +386,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         ));
     }
 
-    // 5. Configure PTRACE_O_TRACEEXEC and PTRACE_O_TRACESYSGOOD.
     let ptrace_options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
     let opt_res = unsafe {
         libc::ptrace(
@@ -435,7 +404,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         ));
     }
 
-    // Resume child from deliberate startup stop (signal 0: do not reinject SIGSTOP).
     let cont_res = unsafe {
         libc::ptrace(
             libc::PTRACE_CONT,
@@ -454,7 +422,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     }
     state = LaunchState::AwaitingExec;
 
-    // 6. Wait for exec event or launch failure.
     let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
     if wait_res < 0 {
         let err = io::Error::last_os_error();
@@ -465,12 +432,10 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         ));
     }
 
-    // Check launch error pipe.
     let launch_err = read_launch_error();
     unsafe { libc::close(pipe_read) };
 
     if let Some(err_payload) = launch_err {
-        // Child failed exec or pre-exec setup. Ensure child is reaped.
         if !libc::WIFEXITED(status) && !libc::WIFSIGNALED(status) {
             unsafe {
                 let _ = libc::waitpid(pid, &mut status, 0);
@@ -506,7 +471,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         }
     }
 
-    // Positive recognition of successful exec:
     let is_exec_event = libc::WIFSTOPPED(status)
         && libc::WSTOPSIG(status) == libc::SIGTRAP
         && ((status >> 16) as libc::c_int) == libc::PTRACE_EVENT_EXEC;
@@ -523,7 +487,6 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
         ));
     }
 
-    // Resume tracee using PTRACE_SYSCALL so all subsequent syscall entry/exit stops are intercepted.
     let cont_res = unsafe {
         libc::ptrace(
             libc::PTRACE_SYSCALL,
@@ -543,13 +506,11 @@ pub fn launch_traced_child(target: &str, args: &[String]) -> Result<libc::pid_t,
     Ok(pid)
 }
 
-/// Executes `target` with `args` under ptrace supervision, optionally streaming events to `trace_path`.
 pub fn run_tracee(
     target: &str,
     args: &[String],
     trace_path: Option<&Path>,
 ) -> Result<TraceeTermination, String> {
-    // If persistent recording is requested, open/truncate output file and write V1 header prior to launch.
     let mut trace_writer = match trace_path {
         Some(path) => {
             let file = File::create(path)
@@ -564,8 +525,6 @@ pub fn run_tracee(
     let result = run_tracee_inner(target, args, &mut trace_writer);
 
     if result.is_err() {
-        // If recording failed prematurely, remove incomplete trace file so a corrupt/unfinalized
-        // file is not left presented as a valid trace.
         if let Some(path) = trace_path {
             let _ = fs::remove_file(path);
         }
@@ -582,16 +541,12 @@ fn run_tracee_inner(
     let pid = launch_traced_child(target, args)?;
     let mut status: libc::c_int = 0;
 
-    // Immediately following PTRACE_EVENT_EXEC, the first syscall stop encountered is the EXIT
-    // stop corresponding to the initial execve completion. This one-time bootstrap condition
-    // is consumed so only target userspace syscalls are reported.
     let mut is_bootstrap_exec_exit = true;
     let mut pending_syscall: Option<PendingSyscall> = None;
     let mut interrupted_syscall: Option<u64> = None;
     let mut current_map_model: Option<MemoryMapModel> = None;
     let mut last_injected_signal: Option<i32> = None;
 
-    // Main event loop: observe syscall entry/exit stops, stream to writer, preserve signals, detect termination.
     loop {
         let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
         if wait_res < 0 {
@@ -647,7 +602,6 @@ fn run_tracee_inner(
                 ));
             }
 
-            // Check if this stop is a syscall-stop marked by PTRACE_O_TRACESYSGOOD (SIGTRAP | 0x80).
             let is_syscall_stop = stop_sig == (libc::SIGTRAP | 0x80);
 
             if is_syscall_stop {
@@ -694,7 +648,6 @@ fn run_tracee_inner(
                     libc::PTRACE_SYSCALL_INFO_EXIT => {
                         let exit = unsafe { info.u.exit };
                         if is_bootstrap_exec_exit {
-                            // Consume the initial post-exec bootstrap exit stop.
                             is_bootstrap_exec_exit = false;
 
                             if let Some(ref mut writer) = trace_writer {
@@ -845,7 +798,6 @@ fn run_tracee_inner(
                                                                 })?;
                                                     }
 
-                                                    // Self-consistency verification (Section 56)
                                                     let mut check_model = cur_model.clone();
                                                     for r in &removes {
                                                         if let Err(e) = check_model.apply_remove(r)
@@ -916,7 +868,6 @@ fn run_tracee_inner(
                     }
                 }
 
-                // Continue to next syscall stop with signal 0 (consuming syscall trap).
                 let cont_res = unsafe {
                     libc::ptrace(
                         libc::PTRACE_SYSCALL,
@@ -927,7 +878,7 @@ fn run_tracee_inner(
                 };
                 if cont_res != 0 {
                     let err = io::Error::last_os_error();
-                    // If ESRCH, tracee may have already terminated; continue loop to reap via waitpid.
+
                     if err.raw_os_error() != Some(libc::ESRCH) {
                         kill_and_reap(pid);
                         return Err(format!("PTRACE_SYSCALL failed for pid {}: {}", pid, err));
@@ -936,7 +887,6 @@ fn run_tracee_inner(
                 continue;
             }
 
-            // Non-syscall stop: signal-delivery stop, group stop, or fault stop.
             let siginfo_res = get_signal_info(pid);
 
             let info = match siginfo_res {
@@ -950,7 +900,6 @@ fn run_tracee_inner(
                 }
             };
 
-            // Validate that si_signo matches the observed stop signal
             if info.si_signo != stop_sig {
                 kill_and_reap(pid);
                 return Err(format!(
@@ -960,9 +909,6 @@ fn run_tracee_inner(
             }
 
             if let Some(ref mut writer) = trace_writer {
-                // Persistent recording mode: validate determinism constraints
-
-                // Group-stops and stopping signals are unsupported in deterministic recording
                 let unsupported_stopping_signals = [
                     libc::SIGKILL,
                     libc::SIGSTOP,
@@ -979,7 +925,6 @@ fn run_tracee_inner(
                     ));
                 }
 
-                // Verify si_code is within supported deterministic classes (SI_USER = 0, SI_TKILL = -6)
                 if info.si_code != libc::SI_USER && info.si_code != libc::SI_TKILL {
                     kill_and_reap(pid);
                     return Err(format!(
@@ -988,7 +933,6 @@ fn run_tracee_inner(
                     ));
                 }
 
-                // If bootstrap execve exit hasn't happened yet, signal delivery is invalid
                 if is_bootstrap_exec_exit {
                     kill_and_reap(pid);
                     return Err(format!(
@@ -997,7 +941,6 @@ fn run_tracee_inner(
                     ));
                 }
 
-                // Signal interposition inside pending/interrupted substituted syscalls is outside M6 deterministic scope
                 let interrupted_subst = pending_syscall
                     .as_ref()
                     .map(|p| p.number)
@@ -1037,7 +980,6 @@ fn run_tracee_inner(
                 last_injected_signal = Some(stop_sig);
             }
 
-            // Reinject signal into tracee upon resumption
             let cont_res = unsafe {
                 libc::ptrace(
                     libc::PTRACE_SYSCALL,
@@ -1048,7 +990,7 @@ fn run_tracee_inner(
             };
             if cont_res != 0 {
                 let err = io::Error::last_os_error();
-                // If ESRCH, tracee may have already terminated; continue loop to reap via waitpid.
+
                 if err.raw_os_error() != Some(libc::ESRCH) {
                     kill_and_reap(pid);
                     return Err(format!(
@@ -1060,7 +1002,6 @@ fn run_tracee_inner(
             continue;
         }
 
-        // Any other wait status is outside lifecycle model.
         kill_and_reap(pid);
         return Err(format!(
             "unexpected wait status 0x{:x} for pid {}: WIFCONTINUED={}",

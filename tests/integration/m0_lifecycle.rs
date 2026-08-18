@@ -64,7 +64,7 @@ fn test_signal_termination_sigterm() {
         .expect("failed to execute causal");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // SIGTERM is signal 15; 128 + 15 = 143
+
     assert_eq!(
         output.status.code(),
         Some(143),
@@ -144,14 +144,12 @@ fn test_permission_denied_executable() {
 
 #[test]
 fn test_invalid_cli_invocations() {
-    // 1. No arguments
     let out1 = Command::new(causal_binary())
         .output()
         .expect("failed to execute causal");
     assert_eq!(out1.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out1.stderr).contains("Usage:"));
 
-    // 2. Only 'record' without target
     let out2 = Command::new(causal_binary())
         .arg("record")
         .output()
@@ -159,7 +157,6 @@ fn test_invalid_cli_invocations() {
     assert_eq!(out2.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out2.stderr).contains("Usage:"));
 
-    // 3. Unknown subcommand
     let out3 = Command::new(causal_binary())
         .arg("nonsense")
         .arg("./tests/bin/exit_42")

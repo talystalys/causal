@@ -18,9 +18,9 @@ int main(int argc, char **argv) {
     fflush(f);
     fclose(f);
 
-    // Busy loop indefinitely until terminated by default action of external signal
+    
     while (1) {
-        // Pure userspace spin
+        
     }
 
     return 0;

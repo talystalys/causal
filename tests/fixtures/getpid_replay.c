@@ -9,12 +9,12 @@
 int main(void) {
     long observed = syscall(SYS_getpid);
     if (observed <= 0) {
-        return 99; // Unexpected syscall error
+        return 99; 
     }
 
     const char *expected_env = getenv("CAUSAL_EXPECT_GETPID");
     if (expected_env == NULL) {
-        return 0; // Baseline record run without expectations
+        return 0; 
     }
 
     char *endptr = NULL;
@@ -22,12 +22,12 @@ int main(void) {
     long expected_val = strtol(expected_env, &endptr, 10);
 
     if (errno != 0 || endptr == expected_env || *endptr != '\0' || expected_val <= 0 || expected_val > INT_MAX) {
-        return 98; // Malformed expectation environment variable
+        return 98; 
     }
 
     if (observed == expected_val) {
-        return 0; // Successfully observed expected (injected) getpid value
+        return 0; 
     }
 
-    return 42; // Invariant violation: observed PID differs from expected
+    return 42; 
 }

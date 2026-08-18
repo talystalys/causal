@@ -4,7 +4,7 @@
 #include <unistd.h>
 
 int main(void) {
-    // Deliberately raise unsupported stopping signal
+    
     raise(SIGSTOP);
     return 0;
 }

@@ -33,7 +33,6 @@ fn test_m3_record_negative_control_and_replay_substitution() {
     let trace_file = std::env::temp_dir().join("test_m3_getpid_replay.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // 1. Test A: Record source trace
     let rec_out = Command::new(causal_binary())
         .env_remove("CAUSAL_EXPECT_GETPID")
         .arg("record")
@@ -62,9 +61,6 @@ fn test_m3_record_negative_control_and_replay_substitution() {
     let recorded_pid = recorded_getpid_res.expect("trace must contain SYS_getpid exit");
     assert!(recorded_pid > 0);
 
-    // 2. Test B: Native negative control
-    // Running the fixture natively with CAUSAL_EXPECT_GETPID=recorded_pid should fail with exit 42
-    // (unless coincidental PID reuse occurs, in which case we retry).
     let mut native_exit = 0;
     for _ in 0..5 {
         let native_out = Command::new(&fixture)
@@ -81,7 +77,6 @@ fn test_m3_record_negative_control_and_replay_substitution() {
         "native negative control must exit 42 when live PID != recorded PID"
     );
 
-    // 3. Test C, D, E: Replay substitution under CAUSAL
     let replay_out = Command::new(causal_binary())
         .env("CAUSAL_EXPECT_GETPID", recorded_pid.to_string())
         .arg("replay")
@@ -131,7 +126,6 @@ fn test_m3_wrong_target_divergence() {
     let trace_file = std::env::temp_dir().join("test_m3_divergence.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // Record getpid_replay
     let rec_out = Command::new(causal_binary())
         .env_remove("CAUSAL_EXPECT_GETPID")
         .arg("record")
@@ -142,7 +136,6 @@ fn test_m3_wrong_target_divergence() {
         .expect("failed to record");
     assert_eq!(rec_out.status.code(), Some(0));
 
-    // Attempt replay against write_hello
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -172,7 +165,6 @@ fn test_m3_corrupt_trace_rejected_before_launch() {
     let corrupt_trace = tmp_dir.join("test_m3_corrupt_prelaunch.causal");
     fs::write(&corrupt_trace, b"NOTMAGIC123456789012345678901234").unwrap();
 
-    // Pass a nonexistent target to prove parse-before-launch (error must be trace error, not exec error)
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&corrupt_trace)
@@ -199,7 +191,6 @@ fn test_m3_trace_without_supported_substitutions_rejected() {
     let trace_file = std::env::temp_dir().join("test_m3_no_substitutions.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // Create synthetic trace containing only SYS_write (nr=1)
     let mut buf = Vec::new();
     let mut writer = causal::trace::TraceWriter::new_v2(&mut buf).unwrap();
     writer
@@ -209,7 +200,6 @@ fn test_m3_trace_without_supported_substitutions_rejected() {
     writer.finish().unwrap();
     fs::write(&trace_file, &buf).unwrap();
 
-    // Replay trace against write_hello
     let replay_out = Command::new(causal_binary())
         .arg("replay")
         .arg(&trace_file)
@@ -230,7 +220,6 @@ fn test_m3_trace_without_supported_substitutions_rejected() {
 
 #[test]
 fn test_m3_invalid_cli_invocations() {
-    // 1. replay without args
     let out1 = Command::new(causal_binary())
         .arg("replay")
         .output()
@@ -238,7 +227,6 @@ fn test_m3_invalid_cli_invocations() {
     assert_eq!(out1.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out1.stderr).contains("Usage:"));
 
-    // 2. replay with only trace arg
     let out2 = Command::new(causal_binary())
         .arg("replay")
         .arg("trace.causal")
@@ -256,7 +244,6 @@ fn test_m3_100_replays_stress() {
     let trace_file = std::env::temp_dir().join("test_m3_100_stress.causal");
     let _ = fs::remove_file(&trace_file);
 
-    // Record ONCE
     let rec_out = Command::new(causal_binary())
         .env_remove("CAUSAL_EXPECT_GETPID")
         .arg("record")
@@ -279,7 +266,6 @@ fn test_m3_100_replays_stress() {
     }
     assert!(recorded_pid > 0);
 
-    // Replay 100 times against the single recorded trace
     for i in 1..=100 {
         let replay_out = Command::new(causal_binary())
             .env("CAUSAL_EXPECT_GETPID", recorded_pid.to_string())

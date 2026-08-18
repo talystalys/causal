@@ -12,21 +12,19 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::ptr;
 
-/// Represents an active live syscall in the replay loop awaiting its corresponding EXIT stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingReplaySyscall {
-    /// Non-substituted syscall passing through to the host kernel.
     Passthrough {
         number: u64,
         recorded_enter_event_id: u64,
     },
-    /// `SYS_getpid` syscall suppressed at ENTRY, awaiting EXIT stop for recorded value injection.
+
     SubstitutedGetpid {
         recorded_enter_event_id: u64,
         recorded_exit_event_id: u64,
         recorded_result: i64,
     },
-    /// `SYS_read` syscall suppressed at ENTRY, awaiting EXIT stop for memory and return injection.
+
     SubstitutedRead {
         recorded_enter_event_id: u64,
         recorded_exit_event_id: u64,
@@ -36,7 +34,6 @@ enum PendingReplaySyscall {
     },
 }
 
-/// Skips validated V3 map metadata events in the replay cursor.
 fn skip_map_metadata(events: &[TraceEvent], cursor: &mut usize) {
     while *cursor < events.len() {
         match &events[*cursor] {
@@ -50,8 +47,6 @@ fn skip_map_metadata(events: &[TraceEvent], cursor: &mut usize) {
     }
 }
 
-/// Arms the next recorded signal delivery via `tgkill` while the tracee is stopped,
-/// without advancing the replay trace cursor.
 fn arm_next_recorded_signal_if_needed(
     events: &[TraceEvent],
     mut cursor: usize,
@@ -108,7 +103,6 @@ fn arm_next_recorded_signal_if_needed(
     Ok(())
 }
 
-/// Writes an exact number of bytes into the stopped remote process address space using `process_vm_writev`.
 pub fn write_process_memory_exact(
     pid: libc::pid_t,
     remote_addr: u64,
@@ -152,13 +146,11 @@ pub fn write_process_memory_exact(
     Ok(())
 }
 
-/// Executes `target` under deterministic replay substitution guided by the trace at `trace_path`.
 pub fn run_replay(
     trace_path: &Path,
     target: &str,
     args: &[String],
 ) -> Result<TraceeTermination, String> {
-    // 1. Read and validate trace file prior to target launch
     let parsed_trace = read_trace_file_versioned(trace_path)?;
     let version = parsed_trace.version;
     let events = parsed_trace.events;
@@ -167,7 +159,6 @@ pub fn run_replay(
         return Err("replay trace contains no events".to_string());
     }
 
-    // 2. Validate prerequisites
     let recorded_tid = events[0].tid();
     for event in &events {
         if event.tid() != recorded_tid {
@@ -231,7 +222,6 @@ pub fn run_replay(
         }
     }
 
-    // Reject signal delivery interposed inside substituted SYS_getpid or SYS_read pairs
     let mut pending_subst_enter: Option<(u64, u64)> = None;
     for event in &events {
         match event {
@@ -267,10 +257,8 @@ pub fn run_replay(
         );
     }
 
-    // 3. Launch target process under ptrace
     let pid = launch_traced_child(target, args)?;
 
-    // 4. Consume initial post-exec bootstrap execve exit stop
     let mut status: libc::c_int = 0;
     let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
     if wait_res < 0 {
@@ -312,10 +300,8 @@ pub fn run_replay(
     let mut armed_signal_event: Option<u64> = None;
     let mut last_injected_signal: Option<i32> = None;
 
-    // Skip initial snapshot metadata if present
     skip_map_metadata(&events, &mut cursor);
 
-    // Arm next signal before initial resume if SignalDelivery is the first execution event
     if let Err(e) =
         arm_next_recorded_signal_if_needed(&events, cursor, pid, &mut armed_signal_event)
     {
@@ -323,7 +309,6 @@ pub fn run_replay(
         return Err(e);
     }
 
-    // Resume tracee to enter main replay loop
     let cont_res = unsafe {
         libc::ptrace(
             libc::PTRACE_SYSCALL,
@@ -341,7 +326,6 @@ pub fn run_replay(
         ));
     }
 
-    // 5. Main replay loop
     loop {
         let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
         if wait_res < 0 {
@@ -419,7 +403,6 @@ pub fn run_replay(
 
             let is_syscall_stop = stop_sig == (libc::SIGTRAP | 0x80);
             if !is_syscall_stop {
-                // Signal delivery stop in replay!
                 let info = match get_signal_info(pid) {
                     Ok(inf) => inf,
                     Err(e) => {
@@ -477,7 +460,6 @@ pub fn run_replay(
                             }
                         }
 
-                        // Restore recorded siginfo via PTRACE_SETSIGINFO
                         let mut restored_info = MaybeUninit::<libc::siginfo_t>::zeroed();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
@@ -498,7 +480,6 @@ pub fn run_replay(
                             ));
                         }
 
-                        // Verify restoration with PTRACE_GETSIGINFO
                         let post_check = match get_signal_info(pid) {
                             Ok(inf) => inf,
                             Err(e) => {
@@ -672,7 +653,6 @@ pub fn run_replay(
                                             ));
                                         }
 
-                                        // Suppress kernel dispatch of SYS_getpid by modifying orig_rax to -1 (u64::MAX)
                                         regs.orig_rax = u64::MAX;
                                         if let Err(e) = set_regs_x86_64(pid, &regs) {
                                             kill_and_reap(pid);
@@ -756,7 +736,6 @@ pub fn run_replay(
                                             ));
                                         }
 
-                                        // Suppress kernel dispatch of SYS_read by modifying orig_rax to -1 (u64::MAX)
                                         regs.orig_rax = u64::MAX;
                                         if let Err(e) = set_regs_x86_64(pid, &regs) {
                                             kill_and_reap(pid);
@@ -835,7 +814,6 @@ pub fn run_replay(
                         return Err(e);
                     }
 
-                    // Resume with PTRACE_SYSCALL
                     let cont_res = unsafe {
                         libc::ptrace(
                             libc::PTRACE_SYSCALL,
@@ -881,7 +859,6 @@ pub fn run_replay(
                                 ));
                             }
 
-                            // Verify suppression sentinel (-ENOSYS)
                             let expected_sentinel = -(libc::ENOSYS as i64);
                             if exit.sval != expected_sentinel {
                                 kill_and_reap(pid);
@@ -895,7 +872,6 @@ pub fn run_replay(
                                 ));
                             }
 
-                            // Inject recorded result into RAX
                             let mut regs = match get_regs_x86_64(pid) {
                                 Ok(r) => r,
                                 Err(e) => {
@@ -910,7 +886,6 @@ pub fn run_replay(
                                 return Err(e);
                             }
 
-                            // Emit concise diagnostic
                             eprintln!(
                                 "replay-substitute event={} syscall=getpid recorded={} live_pid={} suppressed={} injected={}",
                                 recorded_exit_event_id,
@@ -948,7 +923,6 @@ pub fn run_replay(
                                 ));
                             }
 
-                            // Verify suppression sentinel (-ENOSYS)
                             let expected_sentinel = -(libc::ENOSYS as i64);
                             if exit.sval != expected_sentinel {
                                 kill_and_reap(pid);
@@ -1008,7 +982,6 @@ pub fn run_replay(
                                             ));
                                         }
 
-                                        // Step 1: Write recorded bytes to the LIVE buffer address using process_vm_writev
                                         if let Err(e) = write_process_memory_exact(
                                             pid,
                                             live_buffer_address,
@@ -1021,7 +994,6 @@ pub fn run_replay(
                                             ));
                                         }
 
-                                        // Step 2: Inject recorded result into RAX
                                         let mut regs = match get_regs_x86_64(pid) {
                                             Ok(r) => r,
                                             Err(e) => {
@@ -1036,7 +1008,6 @@ pub fn run_replay(
                                             return Err(e);
                                         }
 
-                                        // Step 3: Emit concise read memory diagnostic
                                         eprintln!(
                                             "replay-memory event={} syscall=read recorded_addr=0x{:x} live_addr=0x{:x} len={} suppressed={} injected_result={}",
                                             mem_event_id,
@@ -1057,7 +1028,6 @@ pub fn run_replay(
                                     }
                                 }
                             } else {
-                                // Zero or negative read result: no memory write, inject result into RAX directly
                                 let mut regs = match get_regs_x86_64(pid) {
                                     Ok(r) => r,
                                     Err(e) => {
@@ -1164,7 +1134,6 @@ pub fn run_replay(
                         return Err(e);
                     }
 
-                    // Resume with PTRACE_SYSCALL
                     let cont_res = unsafe {
                         libc::ptrace(
                             libc::PTRACE_SYSCALL,

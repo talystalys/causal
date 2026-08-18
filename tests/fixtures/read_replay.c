@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
         return 42;
     }
 
-    // Verify tail sentinel is completely preserved
+    
     for (size_t i = EXPECTED_LEN; i < BUF_SIZE; i++) {
         if (buf[i] != SENTINEL) {
             return 42;

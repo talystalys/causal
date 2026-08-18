@@ -38,14 +38,12 @@ fn test_deliberate_write_syscall_capture() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Verify SYS_write (nr=1 on x86_64) entry exists with fd=1 (STDOUT_FILENO) and count=6
     let mut found_write_entry = false;
     let mut found_write_exit = false;
 
     let lines: Vec<&str> = stdout.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         if line.starts_with("syscall-enter") && line.contains("nr=1 ") {
-            // Check arguments: arg0 is fd (1), arg1 is buffer address (>0), arg2 is count (6)
             assert!(
                 line.contains("args=[1, "),
                 "write entry must have arg0=1 (STDOUT_FILENO): {}",
@@ -58,7 +56,6 @@ fn test_deliberate_write_syscall_capture() {
             );
             found_write_entry = true;
 
-            // Search forward for the paired exit
             for exit_line in &lines[i + 1..] {
                 if exit_line.starts_with("syscall-exit") && exit_line.contains("nr=1 ") {
                     assert!(
@@ -95,13 +92,11 @@ fn test_getpid_syscall_return_value() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Verify SYS_getpid (nr=39 on x86_64) entry and exit exist and return matching positive pid
     let mut found_getpid = false;
     let lines: Vec<&str> = stdout.lines().collect();
 
     for (i, line) in lines.iter().enumerate() {
         if line.starts_with("syscall-enter") && line.contains("nr=39 ") {
-            // Find tid from line: "syscall-enter tid=1234 nr=39 ..."
             let tid_part = line.split_whitespace().find(|w| w.starts_with("tid="));
             assert!(tid_part.is_some(), "missing tid in entry: {}", line);
             let tid_str = &tid_part.unwrap()[4..];
@@ -171,7 +166,6 @@ fn test_sigtrap_not_confused_with_syscall_stop() {
         .output()
         .expect("failed to execute causal");
 
-    // SIGTRAP is signal 5; exit code should be 128 + 5 = 133
     assert_eq!(
         output.status.code(),
         Some(133),

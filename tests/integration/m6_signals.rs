@@ -109,10 +109,6 @@ fn create_raw_siginfo(
     raw
 }
 
-// ---------------------------------------------------------------------------
-// Process-Group Timeout Harness for Hang-Capable CLI Invocations
-// ---------------------------------------------------------------------------
-
 struct TimedChild {
     child: Child,
     pgid: libc::pid_t,
@@ -236,10 +232,6 @@ fn wait_with_deadline(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. ABI Size and Codec Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_abi_size_proof() {
     assert_eq!(
@@ -331,10 +323,6 @@ fn test_m6_v4_deterministic_serialization() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2. Structural Adjacency Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_bug_a_signal_breaks_read_memory_write_adjacency_rejected() {
     let region = dummy_stack_region();
@@ -376,7 +364,6 @@ fn test_m6_bug_b_signal_breaks_map_delta_adjacency_rejected() {
     let map_reg = dummy_mapped_region();
     let raw_siginfo = create_raw_siginfo(libc::SIGUSR1, 0, libc::SI_USER, 1, 0);
 
-    // Case 1: SyscallExit(mmap) -> SignalDelivery -> MemoryMapAdd
     let mut buf1 = Vec::new();
     let mut w1 = TraceWriter::new_v4(&mut buf1).unwrap();
     w1.write_memory_map_snapshot(1, std::slice::from_ref(&region))
@@ -402,7 +389,6 @@ fn test_m6_bug_b_signal_breaks_map_delta_adjacency_rejected() {
         err1
     );
 
-    // Case 2: SyscallExit(mprotect) -> MemoryMapRemove -> SignalDelivery -> MemoryMapAdd
     let mut buf2 = Vec::new();
     let mut w2 = TraceWriter::new_v4(&mut buf2).unwrap();
     w2.write_memory_map_snapshot(1, std::slice::from_ref(&region))
@@ -439,7 +425,7 @@ fn test_m6_structural_signal_between_syscall_pair() {
     writer
         .write_memory_map_snapshot(1, std::slice::from_ref(&region))
         .unwrap();
-    writer.write_syscall_enter(1, 1, [0; 6]).unwrap(); // SYS_write
+    writer.write_syscall_enter(1, 1, [0; 6]).unwrap();
     writer
         .write_signal_delivery(1, libc::SIGUSR1, 0, libc::SI_USER, &raw_siginfo)
         .unwrap();
@@ -450,16 +436,11 @@ fn test_m6_structural_signal_between_syscall_pair() {
     assert_eq!(parsed.events.len(), 4);
 }
 
-// ---------------------------------------------------------------------------
-// 3. Replay Preflight Validation Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_replay_preflight_unsupported_signal_rejected_prelaunch() {
     let region = dummy_stack_region();
     let raw_siginfo_stop = create_raw_siginfo(libc::SIGSTOP, 0, libc::SI_USER, 1, 0);
 
-    // 1. Trace with SIGSTOP
     let mut buf1 = Vec::new();
     let mut w1 = TraceWriter::new_v4(&mut buf1).unwrap();
     w1.write_memory_map_snapshot(1, std::slice::from_ref(&region))
@@ -480,7 +461,6 @@ fn test_m6_replay_preflight_unsupported_signal_rejected_prelaunch() {
         err1
     );
 
-    // 2. Trace with unsupported si_code (e.g. 123)
     let raw_siginfo_code = create_raw_siginfo(libc::SIGUSR1, 0, 123, 1, 0);
     let mut buf2 = Vec::new();
     let mut w2 = TraceWriter::new_v4(&mut buf2).unwrap();
@@ -511,7 +491,6 @@ fn test_m6_replay_preflight_signal_interposed_in_substituted_syscall_rejected() 
     let region = dummy_stack_region();
     let raw_siginfo = create_raw_siginfo(libc::SIGUSR1, 0, libc::SI_USER, 1, 0);
 
-    // Case 1: Interposed inside SYS_getpid
     let mut buf1 = Vec::new();
     let mut w1 = TraceWriter::new_v4(&mut buf1).unwrap();
     w1.write_memory_map_snapshot(1, std::slice::from_ref(&region))
@@ -538,7 +517,6 @@ fn test_m6_replay_preflight_signal_interposed_in_substituted_syscall_rejected() 
         err1
     );
 
-    // Case 2: Interposed inside SYS_read (result 0 so no KernelMemoryWrite needed)
     let mut buf2 = Vec::new();
     let mut w2 = TraceWriter::new_v4(&mut buf2).unwrap();
     w2.write_memory_map_snapshot(1, std::slice::from_ref(&region))
@@ -569,10 +547,6 @@ fn test_m6_replay_preflight_signal_interposed_in_substituted_syscall_rejected() 
     let _ = fs::remove_file(&trace_path2);
 }
 
-// ---------------------------------------------------------------------------
-// 4. Parser-Level Corruption Tests with Diagnostic Substring Proofs
-// ---------------------------------------------------------------------------
-
 fn create_raw_signal_trace_v(version: u32) -> Vec<u8> {
     let raw_sig = create_raw_siginfo(libc::SIGUSR1, 0, libc::SI_USER, 1, 0);
     let mut bytes = Vec::new();
@@ -582,19 +556,17 @@ fn create_raw_signal_trace_v(version: u32) -> Vec<u8> {
     bytes.push(BYTE_ORDER_LITTLE_ENDIAN);
     bytes.push(POINTER_WIDTH_64);
 
-    // Record length: 32 + 128 = 160
     bytes.extend_from_slice(&160_u32.to_le_bytes());
-    bytes.push(7); // kind = 7 (SignalDelivery)
+    bytes.push(7);
     bytes.extend_from_slice(&[0_u8; 3]);
-    bytes.extend_from_slice(&1_u64.to_le_bytes()); // event_id = 1
-    bytes.extend_from_slice(&1_u32.to_le_bytes()); // tid = 1
+    bytes.extend_from_slice(&1_u64.to_le_bytes());
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
     bytes.extend_from_slice(&libc::SIGUSR1.to_le_bytes());
     bytes.extend_from_slice(&0_i32.to_le_bytes());
     bytes.extend_from_slice(&libc::SI_USER.to_le_bytes());
     bytes.extend_from_slice(&128_u32.to_le_bytes());
     bytes.extend_from_slice(&raw_sig);
 
-    // Footer: event_count = 1, magic = CAUSEND\0
     bytes.extend_from_slice(&1_u64.to_le_bytes());
     bytes.extend_from_slice(b"CAUSEND\0");
     bytes
@@ -602,7 +574,6 @@ fn create_raw_signal_trace_v(version: u32) -> Vec<u8> {
 
 #[test]
 fn test_m6_old_version_kind_7_parser_rejections() {
-    // V1 with raw kind 7
     let v1 = create_raw_signal_trace_v(1);
     let err1 = parse_trace_bytes(&v1).unwrap_err();
     assert!(
@@ -611,7 +582,6 @@ fn test_m6_old_version_kind_7_parser_rejections() {
         err1
     );
 
-    // V2 with raw kind 7
     let v2 = create_raw_signal_trace_v(2);
     let err2 = parse_trace_bytes(&v2).unwrap_err();
     assert!(
@@ -620,7 +590,6 @@ fn test_m6_old_version_kind_7_parser_rejections() {
         err2
     );
 
-    // V3 with raw kind 7
     let v3 = create_raw_signal_trace_v(3);
     let err3 = parse_trace_bytes(&v3).unwrap_err();
     assert!(
@@ -635,31 +604,27 @@ fn test_m6_truncated_siginfo_boundary_parser_rejection() {
     let region = dummy_stack_region();
     let raw_sig = create_raw_siginfo(libc::SIGUSR1, 0, libc::SI_USER, 1, 0);
 
-    // Valid V4 header + Snapshot + SignalDelivery declaring 160 bytes but physically giving only 50 bytes + Valid Footer
     let mut bytes = Vec::new();
     let mut w = TraceWriter::new_v4(&mut bytes).unwrap();
     w.write_memory_map_snapshot(1, std::slice::from_ref(&region))
         .unwrap();
     w.finish().unwrap();
 
-    // Strip the footer (last 16 bytes)
     let footer = bytes.split_off(bytes.len() - 16);
 
-    // Append SignalDelivery with declared length 160 but only 50 physical bytes before the valid footer
-    bytes.extend_from_slice(&160_u32.to_le_bytes()); // Declared record length 160
-    bytes.push(7); // kind = 7
+    bytes.extend_from_slice(&160_u32.to_le_bytes());
+    bytes.push(7);
     bytes.extend_from_slice(&[0_u8; 3]);
-    bytes.extend_from_slice(&2_u64.to_le_bytes()); // event_id = 2
-    bytes.extend_from_slice(&1_u32.to_le_bytes()); // tid = 1
+    bytes.extend_from_slice(&2_u64.to_le_bytes());
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
     bytes.extend_from_slice(&libc::SIGUSR1.to_le_bytes());
     bytes.extend_from_slice(&0_i32.to_le_bytes());
     bytes.extend_from_slice(&libc::SI_USER.to_le_bytes());
     bytes.extend_from_slice(&128_u32.to_le_bytes());
-    bytes.extend_from_slice(&raw_sig[..18]); // Only 18 bytes of siginfo (total body = 50 bytes)
+    bytes.extend_from_slice(&raw_sig[..18]);
 
-    // Append valid footer declaring event_count = 2
     bytes.extend_from_slice(&2_u64.to_le_bytes());
-    bytes.extend_from_slice(&footer[8..16]); // CAUSEND\0
+    bytes.extend_from_slice(&footer[8..16]);
 
     let err = parse_trace_bytes(&bytes).unwrap_err();
     assert!(
@@ -684,7 +649,6 @@ fn test_m6_corruption_diagnostic_reasons() {
 
     let sig_rec_offset = 16 + 4 + u32::from_le_bytes(valid_v4[16..20].try_into().unwrap()) as usize;
 
-    // 1. signal_number = 0
     let mut bad_sig0 = valid_v4.clone();
     bad_sig0[sig_rec_offset + 4 + 16..sig_rec_offset + 4 + 20]
         .copy_from_slice(&0_i32.to_le_bytes());
@@ -695,7 +659,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err0
     );
 
-    // 2. signal_number > 64 (65)
     let mut bad_sig65 = valid_v4.clone();
     bad_sig65[sig_rec_offset + 4 + 16..sig_rec_offset + 4 + 20]
         .copy_from_slice(&65_i32.to_le_bytes());
@@ -706,7 +669,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err65
     );
 
-    // 3. Short record length (< 32)
     let mut short_hdr = valid_v4.clone();
     short_hdr[sig_rec_offset..sig_rec_offset + 4].copy_from_slice(&20_u32.to_le_bytes());
     let err_short_hdr = parse_trace_bytes(&short_hdr).unwrap_err();
@@ -716,7 +678,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_short_hdr
     );
 
-    // 4. siginfo_len < 128 (64)
     let mut bad_len_short = valid_v4.clone();
     bad_len_short[sig_rec_offset + 4 + 28..sig_rec_offset + 4 + 32]
         .copy_from_slice(&64_u32.to_le_bytes());
@@ -727,7 +688,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_short_len
     );
 
-    // 5. siginfo_len > 128 (256)
     let mut bad_len_long = valid_v4.clone();
     bad_len_long[sig_rec_offset + 4 + 28..sig_rec_offset + 4 + 32]
         .copy_from_slice(&256_u32.to_le_bytes());
@@ -738,7 +698,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_long_len
     );
 
-    // 6. record_length / siginfo_len mismatch
     let mut bad_rec_len = valid_v4.clone();
     bad_rec_len[sig_rec_offset..sig_rec_offset + 4].copy_from_slice(&150_u32.to_le_bytes());
     let err_rec_mismatch = parse_trace_bytes(&bad_rec_len).unwrap_err();
@@ -748,7 +707,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_rec_mismatch
     );
 
-    // 7. Raw si_signo mismatch
     let mut bad_raw_signo = valid_v4.clone();
     bad_raw_signo[sig_rec_offset + 4 + 32..sig_rec_offset + 4 + 36]
         .copy_from_slice(&libc::SIGTERM.to_le_bytes());
@@ -759,7 +717,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_raw_signo
     );
 
-    // 8. Raw si_errno mismatch
     let mut bad_raw_errno = valid_v4.clone();
     bad_raw_errno[sig_rec_offset + 4 + 36..sig_rec_offset + 4 + 40]
         .copy_from_slice(&99_i32.to_le_bytes());
@@ -770,7 +727,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_raw_errno
     );
 
-    // 9. Raw si_code mismatch
     let mut bad_raw_code = valid_v4.clone();
     bad_raw_code[sig_rec_offset + 4 + 40..sig_rec_offset + 4 + 44]
         .copy_from_slice(&99_i32.to_le_bytes());
@@ -781,7 +737,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_raw_code
     );
 
-    // 10. Unknown V4 event kind (kind 8)
     let mut unknown_kind = valid_v4.clone();
     unknown_kind[sig_rec_offset + 4] = 8;
     let err_unknown = parse_trace_bytes(&unknown_kind).unwrap_err();
@@ -791,7 +746,6 @@ fn test_m6_corruption_diagnostic_reasons() {
         err_unknown
     );
 
-    // 11. SignalDelivery before required MemoryMapSnapshot in V4
     let raw_sig = create_raw_siginfo(libc::SIGUSR1, 0, libc::SI_USER, 1, 0);
     let mut manual_v4 = Vec::new();
     manual_v4.extend_from_slice(TRACE_HEADER_MAGIC);
@@ -819,10 +773,6 @@ fn test_m6_corruption_diagnostic_reasons() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5. Timeout Harness Self-Test (Intentional Hang Cleanup Proof)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_timeout_harness_kills_stuck_process_group() {
     let fixture = get_fixture_path("signal_external_term");
@@ -841,7 +791,6 @@ fn test_m6_timeout_harness_kills_stuck_process_group() {
     let timed_child = spawn_in_own_process_group(&mut cmd, "hang_test");
     let pgid = timed_child.pgid;
 
-    // Wait until fixture writes PID, then DO NOT send SIGTERM
     let mut target_pid: Option<i32> = None;
     let poll_start = Instant::now();
     while poll_start.elapsed() < Duration::from_secs(3) {
@@ -855,11 +804,9 @@ fn test_m6_timeout_harness_kills_stuck_process_group() {
     }
     let target_pid = target_pid.expect("target failed to write ready file");
 
-    // Call wait_with_deadline with a short deadline (500ms)
     let res = wait_with_deadline(timed_child, Duration::from_millis(500));
     assert!(res.is_err(), "must report timeout error");
 
-    // Verify tracee PID returned ESRCH to kill(pid, 0)
     let tracee_alive = unsafe { libc::kill(target_pid, 0) };
     assert_eq!(tracee_alive, -1);
     assert_eq!(
@@ -868,7 +815,6 @@ fn test_m6_timeout_harness_kills_stuck_process_group() {
         "tracee must be destroyed"
     );
 
-    // Verify process group returned ESRCH
     let pg_alive = unsafe { libc::kill(-pgid, 0) };
     assert_eq!(pg_alive, -1);
     assert_eq!(
@@ -881,10 +827,6 @@ fn test_m6_timeout_harness_kills_stuck_process_group() {
     let _ = fs::remove_file(&ready_file);
 }
 
-// ---------------------------------------------------------------------------
-// 6. Flagship External SIGUSR1 Recording & Replay Proof (Timed Subprocess)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_external_sigusr1_recording_and_replay() {
     let fixture = get_fixture_path("signal_external_usr1");
@@ -895,7 +837,6 @@ fn test_m6_external_sigusr1_recording_and_replay() {
 
     let sender_pid = std::process::id() as i32;
 
-    // 1. Spawning timed CAUSAL record subprocess
     let mut rec_cmd = Command::new(causal_binary());
     rec_cmd
         .arg("record")
@@ -908,7 +849,6 @@ fn test_m6_external_sigusr1_recording_and_replay() {
 
     let rec_child = spawn_in_own_process_group(&mut rec_cmd, "usr1_rec");
 
-    // Sender thread sends SIGUSR1 once ready
     let ready_clone = ready_file.clone();
     let sender_thread = thread::spawn(move || {
         let start = Instant::now();
@@ -966,7 +906,6 @@ fn test_m6_external_sigusr1_recording_and_replay() {
 
     let _ = fs::remove_file(&ready_file);
 
-    // 2. REPLAY PROOF: Replay with ABSOLUTELY NO external sender thread/signal!
     let replay_ready = std::env::temp_dir().join(format!(
         "causal_replay_ready_usr1_{}.pid",
         std::process::id()
@@ -996,10 +935,6 @@ fn test_m6_external_sigusr1_recording_and_replay() {
     let _ = fs::remove_file(&replay_ready);
 }
 
-// ---------------------------------------------------------------------------
-// 7. Default-Action SIGTERM Termination Proof (Timed Subprocess)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_external_sigterm_default_action_record_and_replay() {
     let fixture = get_fixture_path("signal_external_term");
@@ -1008,7 +943,6 @@ fn test_m6_external_sigterm_default_action_record_and_replay() {
         std::env::temp_dir().join(format!("causal_ready_term_{}.pid", std::process::id()));
     let _ = fs::remove_file(&ready_file);
 
-    // 1. Recording timed subprocess
     let mut rec_cmd = Command::new(causal_binary());
     rec_cmd
         .arg("record")
@@ -1054,7 +988,6 @@ fn test_m6_external_sigterm_default_action_record_and_replay() {
     });
     assert!(has_sigterm, "trace must contain SignalDelivery(SIGTERM)");
 
-    // 2. Replay with NO external signal sender
     let replay_ready = std::env::temp_dir().join(format!(
         "causal_replay_ready_term_{}.pid",
         std::process::id()
@@ -1072,17 +1005,12 @@ fn test_m6_external_sigterm_default_action_record_and_replay() {
     let rep_out =
         wait_with_deadline(rep_child, Duration::from_secs(10)).expect("replay timed out or failed");
 
-    // Exit code must be 128 + 15 = 143
     assert_eq!(rep_out.status.code(), Some(128 + libc::SIGTERM));
 
     let _ = fs::remove_file(&trace_path);
     let _ = fs::remove_file(&ready_file);
     let _ = fs::remove_file(&replay_ready);
 }
-
-// ---------------------------------------------------------------------------
-// 8. Live Blocked SYS_read Signal Interposition Rejection Proof
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_m6_signal_during_read_unsupported_rejected_record() {
@@ -1116,7 +1044,7 @@ fn test_m6_signal_during_read_unsupported_rejected_record() {
         }
 
         let pid = target_pid.expect("target failed to write readiness file within 5s");
-        thread::sleep(Duration::from_millis(30)); // Ensure target entered blocking SYS_read
+        thread::sleep(Duration::from_millis(30));
 
         let res = unsafe { libc::kill(pid, libc::SIGUSR1) };
         assert_eq!(res, 0, "failed to send SIGUSR1 to target blocked on read");
@@ -1127,13 +1055,11 @@ fn test_m6_signal_during_read_unsupported_rejected_record() {
         .expect("recording timed out or hung unexpectedly");
     let target_pid = sender_thread.join().unwrap();
 
-    // Must fail recording
     assert!(
         !out.status.success(),
         "record must fail when signal interposes inside SYS_read"
     );
 
-    // Stderr or stdout must contain specific diagnostic
     let combined_out = format!("{}\n{}", out.stdout, out.stderr);
     assert!(
         combined_out.contains("signal 10 interposed inside pending SYS_read"),
@@ -1146,13 +1072,11 @@ fn test_m6_signal_during_read_unsupported_rejected_record() {
         combined_out
     );
 
-    // Incomplete trace must be removed
     assert!(
         !trace_path.exists(),
         "incomplete trace file must be removed on failure"
     );
 
-    // Target process must be reaped
     let tracee_alive = unsafe { libc::kill(target_pid, 0) };
     assert_eq!(tracee_alive, -1);
     assert_eq!(
@@ -1163,10 +1087,6 @@ fn test_m6_signal_during_read_unsupported_rejected_record() {
 
     let _ = fs::remove_file(&ready_file);
 }
-
-// ---------------------------------------------------------------------------
-// 9. Multiple Signals & Interleaved Execution
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_m6_multiple_supported_signals_roundtrip() {
@@ -1191,10 +1111,6 @@ fn test_m6_multiple_supported_signals_roundtrip() {
 
     let _ = fs::remove_file(&trace_path);
 }
-
-// ---------------------------------------------------------------------------
-// 10. Unsupported Signals & Fault Rejection (Timed Subprocesses)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_m6_unsupported_stopping_signal_rejected() {
@@ -1242,10 +1158,6 @@ fn test_m6_unsupported_synchronous_fault_rejected() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 11. SIGTRAP Classification
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_sigtrap_classification() {
     let fixture = get_fixture_path("raise_sigtrap");
@@ -1269,10 +1181,6 @@ fn test_m6_sigtrap_classification() {
 
     let _ = fs::remove_file(&trace_path);
 }
-
-// ---------------------------------------------------------------------------
-// 12. Replay Divergence on Unrecorded Live Signal (Timed Subprocess)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_m6_replay_divergence_unrecorded_live_signal() {
@@ -1347,10 +1255,6 @@ fn test_m6_replay_divergence_unrecorded_live_signal() {
     let _ = fs::remove_file(&ready_file);
 }
 
-// ---------------------------------------------------------------------------
-// 13. Historical Maps Query Support
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_v4_historical_maps_query() {
     let fixture = get_fixture_path("map_model");
@@ -1378,10 +1282,6 @@ fn test_m6_v4_historical_maps_query() {
     let _ = fs::remove_file(&trace_path);
 }
 
-// ---------------------------------------------------------------------------
-// 14. Flagship 100-Replay Stress Test with Per-Iteration Process Deadlines
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_m6_100_replays_stress() {
     let fixture = get_fixture_path("signal_external_usr1");
@@ -1392,7 +1292,6 @@ fn test_m6_100_replays_stress() {
 
     let sender_pid = std::process::id() as i32;
 
-    // 1. Record once with external signal
     let mut rec_cmd = Command::new(causal_binary());
     rec_cmd
         .arg("record")
@@ -1433,7 +1332,6 @@ fn test_m6_100_replays_stress() {
 
     let _ = fs::remove_file(&ready_file);
 
-    // 2. Replay 100 times in isolated process groups with per-iteration deadlines and ZERO external signals
     for i in 1..=100 {
         let replay_ready = std::env::temp_dir().join(format!(
             "causal_replay_stress_{}_{}.pid",

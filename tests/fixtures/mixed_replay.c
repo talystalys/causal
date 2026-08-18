@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
         return 99;
     }
 
-    // 1. SYS_getpid check
+    
     long pid = syscall(SYS_getpid);
     const char *expected_env = getenv("CAUSAL_EXPECT_GETPID");
     if (expected_env != NULL && *expected_env != '\0') {
@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // 2. SYS_read check
+    
     const char *path = argv[1];
     long fd = syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CREAT, 0600);
     if (fd < 0) {
