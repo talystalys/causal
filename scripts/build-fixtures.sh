@@ -32,5 +32,6 @@ echo "Compiling fixtures using ${CC} ${CFLAGS}..."
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/signal_stop_unsupported.c" -o "${BIN_DIR}/signal_stop_unsupported"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/signal_segv_unsupported.c" -o "${BIN_DIR}/signal_segv_unsupported"
 "${CC}" ${CFLAGS} "${FIXTURES_DIR}/signal_multi_usr.c" -o "${BIN_DIR}/signal_multi_usr"
+"${CC}" ${CFLAGS} "${FIXTURES_DIR}/signal_during_read_unsupported.c" -o "${BIN_DIR}/signal_during_read_unsupported"
 
 echo "Fixtures built successfully in ${BIN_DIR}."

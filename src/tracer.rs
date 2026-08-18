@@ -1,7 +1,7 @@
 use crate::maps::{read_process_maps, MemoryMapModel};
 use crate::trace::{
-    TraceWriter, SYS_BRK_X86_64, SYS_MMAP_X86_64, SYS_MPROTECT_X86_64, SYS_MUNMAP_X86_64,
-    SYS_READ_X86_64, TRACE_VERSION_3,
+    is_substituted_syscall, substituted_syscall_name, TraceWriter, SYS_BRK_X86_64, SYS_MMAP_X86_64,
+    SYS_MPROTECT_X86_64, SYS_MUNMAP_X86_64, SYS_READ_X86_64, TRACE_VERSION_3,
 };
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -587,6 +587,7 @@ fn run_tracee_inner(
     // is consumed so only target userspace syscalls are reported.
     let mut is_bootstrap_exec_exit = true;
     let mut pending_syscall: Option<PendingSyscall> = None;
+    let mut interrupted_syscall: Option<u64> = None;
     let mut current_map_model: Option<MemoryMapModel> = None;
     let mut last_injected_signal: Option<i32> = None;
 
@@ -676,6 +677,7 @@ fn run_tracee_inner(
                             number,
                             args,
                         });
+                        interrupted_syscall = None;
                         println!(
                             "syscall-enter tid={} nr={} args=[{}, {}, {}, {}, {}, {}]",
                             pid, number, args[0], args[1], args[2], args[3], args[4], args[5]
@@ -729,6 +731,11 @@ fn run_tracee_inner(
                                         "syscall-exit  tid={} nr={} result={}",
                                         pid, pending.number, exit.sval
                                     );
+                                    if is_substituted_syscall(pending.number) && exit.sval < 0 {
+                                        interrupted_syscall = Some(pending.number);
+                                    } else {
+                                        interrupted_syscall = None;
+                                    }
                                     if let Some(ref mut writer) = trace_writer {
                                         let exit_event_id = writer
                                             .write_syscall_exit(
@@ -987,6 +994,22 @@ fn run_tracee_inner(
                     return Err(format!(
                         "pid {}: signal {} delivered before initial bootstrap MemoryMapSnapshot",
                         pid, stop_sig
+                    ));
+                }
+
+                // Signal interposition inside pending/interrupted substituted syscalls is outside M6 deterministic scope
+                let interrupted_subst = pending_syscall
+                    .as_ref()
+                    .map(|p| p.number)
+                    .or(interrupted_syscall)
+                    .filter(|&nr| is_substituted_syscall(nr));
+
+                if let Some(nr) = interrupted_subst {
+                    kill_and_reap(pid);
+                    let name = substituted_syscall_name(nr);
+                    return Err(format!(
+                        "pid {}: signal {} interposed inside pending {}; signal interposition inside substituted SYS_read/SYS_getpid pairs is outside M6 deterministic replay scope",
+                        pid, stop_sig, name
                     ));
                 }
 

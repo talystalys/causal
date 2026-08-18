@@ -1,4 +1,7 @@
-use crate::trace::{read_trace_file_versioned, TraceEvent, TRACE_VERSION_2};
+use crate::trace::{
+    is_substituted_syscall, read_trace_file_versioned, substituted_syscall_name, TraceEvent,
+    TRACE_VERSION_2,
+};
 pub use crate::trace::{SYS_GETPID_X86_64, SYS_READ_X86_64};
 use crate::tracer::{
     get_regs_x86_64, get_signal_info, get_syscall_info, kill_and_reap, launch_traced_child,
@@ -235,7 +238,7 @@ pub fn run_replay(
             TraceEvent::SyscallEnter {
                 event_id, number, ..
             } => {
-                if *number == SYS_GETPID_X86_64 || *number == SYS_READ_X86_64 {
+                if is_substituted_syscall(*number) {
                     pending_subst_enter = Some((*event_id, *number));
                 } else {
                     pending_subst_enter = None;
@@ -243,11 +246,7 @@ pub fn run_replay(
             }
             TraceEvent::SignalDelivery { event_id, .. } => {
                 if let Some((enter_id, nr)) = pending_subst_enter {
-                    let name = if nr == SYS_GETPID_X86_64 {
-                        "SYS_getpid"
-                    } else {
-                        "SYS_read"
-                    };
+                    let name = substituted_syscall_name(nr);
                     return Err(format!(
                         "replay error at event {}: SignalDelivery interposed inside substituted {} pair (entry event {}) is outside M6 deterministic scope",
                         event_id, name, enter_id

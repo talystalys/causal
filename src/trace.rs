@@ -78,11 +78,26 @@ pub const FOOTER_SIZE: usize = 16;
 
 /// Known Linux x86-64 syscall numbers.
 pub const SYS_READ_X86_64: u64 = 0;
+pub const SYS_WRITE_X86_64: u64 = 1;
 pub const SYS_MMAP_X86_64: u64 = 9;
 pub const SYS_MPROTECT_X86_64: u64 = 10;
 pub const SYS_MUNMAP_X86_64: u64 = 11;
 pub const SYS_BRK_X86_64: u64 = 12;
 pub const SYS_GETPID_X86_64: u64 = 39;
+
+/// Returns true if the syscall is substituted deterministically by CAUSAL (M6: SYS_read, SYS_getpid).
+pub fn is_substituted_syscall(number: u64) -> bool {
+    number == SYS_READ_X86_64 || number == SYS_GETPID_X86_64
+}
+
+/// Returns human-readable name for substituted syscalls.
+pub fn substituted_syscall_name(number: u64) -> &'static str {
+    match number {
+        SYS_READ_X86_64 => "SYS_read",
+        SYS_GETPID_X86_64 => "SYS_getpid",
+        _ => "unknown syscall",
+    }
+}
 pub const SYS_EXIT_X86_64: u64 = 60;
 pub const SYS_EXIT_GROUP_X86_64: u64 = 231;
 
